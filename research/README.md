@@ -44,6 +44,62 @@ Key features:
 
 Forward 5-day and 22-day SPX returns are also computed for regime evaluation.
 
+## Model Input Features
+
+The regime models do not all use the same inputs. The exact input feature sets are:
+
+### Threshold Input Features
+
+The threshold regime uses a composite percentile score built from:
+
+- `RV_21`
+- `VIX`
+- `sign_flip_21`
+
+These inputs are chosen because they directly describe short-term realized volatility, market-implied volatility, and choppiness.
+
+### Clustering Input Features
+
+The clustering regime uses these standardized inputs:
+
+- `VIX`
+- `RV_21`
+- `RV_63`
+- `VRP_21`
+- `trend_63`
+- `ma_gap_50_200`
+- `drawdown_252`
+- `sign_flip_21`
+
+These inputs combine volatility level, implied-versus-realized volatility, trend, drawdown, and choppiness.
+
+### HMM Input Features
+
+The HMM regime uses a smaller standardized feature set:
+
+- `VIX`
+- `RV_21`
+- `RV_63`
+- `trend_63`
+- `drawdown_252`
+- `sign_flip_21`
+
+The HMM input set is intentionally simpler than the clustering set to reduce instability in rolling walk-forward fits.
+
+### Evaluation-Only Features
+
+These columns are not direct model inputs for the current regime classifiers. They are used for diagnostics, context, or future feature experiments:
+
+- `SPX_ret`
+- `trend_126`
+- `lagged_VRP_21`
+- `abs_ret_21`
+- `vix9d_vix`
+- `vvix_vix`
+- `skew_sdex`
+- `fwd_ret_5d`
+- `fwd_ret_22d`
+
 ## Regime Methods
 
 The notebook compares three two-state regime classifiers.
