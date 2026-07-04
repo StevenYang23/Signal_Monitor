@@ -39,6 +39,10 @@ class HMMVolatilityRegime:
         "drawdown_chop": ["drawdown_22", "sign_flip_22"],
         "vol_slope_chop": ["VIX", "RV_63_22", "sign_flip_22"],
         "all_vol": ["VIX", "RV_22", "RV_63", "RV_63_22", "lagged_VRP"],
+        "recommended": [
+            "VIX", "RV_63_22", "trend_63", "drawdown_22",
+            "lagged_VRP", "sign_flip_22",
+        ],
         "full": ALL_FEATURE_COLUMNS,
     }
 
@@ -228,7 +232,7 @@ class HMMVolatilityRegime:
         if model is None:
             raise RuntimeError("HMM fit failed on training data.")
 
-        low_state, high_state = self._state_indices_from_model(model)
+        low_state, high_state = self._state_indices_from_model(model, train_data=train_data)
         train_probs = model.predict_proba(x_train)
         regimes = self._build_regime_frame(
             train_data.index,
@@ -421,7 +425,7 @@ class HMMVolatilityRegime:
                 if model is None:
                     continue
                 current_model = model
-                low_state, high_state = self._state_indices_from_model(model)
+                low_state, high_state = self._state_indices_from_model(model, train_data=train)
 
             score = df_model.iloc[loc_idx - self.train_window + 1 : loc_idx + 1]
             try:
@@ -473,6 +477,19 @@ class HMMVolatilityRegime:
         forward_rv_by_regime = forward_eval.groupby("hmm")["forward_RV_22"].mean()
         high_forward_rv = float(forward_rv_by_regime.get("high_vol", np.nan))
         low_forward_rv = float(forward_rv_by_regime.get("low_vol", np.nan))
+        # Detect and correct flipped state labels
+        if (np.isfinite(high_forward_rv) and np.isfinite(low_forward_rv)
+                and high_forward_rv < low_forward_rv):
+            aligned["hmm"] = aligned["hmm"].map({"high_vol": "low_vol", "low_vol": "high_vol"})
+            aligned["trade_signal"] = ~aligned["trade_signal"]
+            high_vol = aligned["hmm"].eq("high_vol")
+            regime_changes = aligned["hmm"].ne(aligned["hmm"].shift())
+            flips = max(int(regime_changes.sum()) - 1, 0)
+            durations = aligned["hmm"].groupby(regime_changes.cumsum()).size()
+            forward_eval = aligned[["hmm"]].join(forward_rv_22.rename("forward_RV_22")).dropna()
+            forward_rv_by_regime = forward_eval.groupby("hmm")["forward_RV_22"].mean()
+            high_forward_rv = float(forward_rv_by_regime.get("high_vol", np.nan))
+            low_forward_rv = float(forward_rv_by_regime.get("low_vol", np.nan))
 
         signal = aligned["trade_signal"].shift(1).fillna(False).astype(int)
         strategy_ret = aligned["SPX_ret"] * signal
@@ -1026,10 +1043,14 @@ class HMMVolatilityRegime:
         return model
 
     @staticmethod
-    def _state_indices_from_model(model: GaussianHMM) -> tuple[int, int]:
-        mean_0 = model.means_[0][0]
-        mean_1 = model.means_[1][0]
-        if mean_0 > mean_1:
+    def _state_indices_from_model(
+        model: GaussianHMM,
+        train_data: pd.DataFrame | None = None,
+    ) -> tuple[int, int]:
+        """Return (low_state, high_state) from first feature mean.
+        High-vol state = state with higher mean on the first feature.
+        """
+        if model.means_[0][0] >= model.means_[1][0]:
             return 0, 1
         return 1, 0
 

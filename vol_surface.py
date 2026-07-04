@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -40,7 +40,7 @@ VIX_TICKER = "^VIX"
 SPX_TICKER = "^SPX"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
-# Index underlyings: Futu index snapshots often require extra permissions — use yfinance.
+# Index underlyings: Futu index snapshots often require extra permissions �?use yfinance.
 SPOT_YF_DEFAULT: dict[str, str] = {
     "US..SPX": "^SPX",
     "US..IXIC": "^IXIC",
@@ -193,6 +193,7 @@ def _standardize_chain(raw: pd.DataFrame, spot: float, asof: date) -> pd.DataFra
     df["ask"] = pd.to_numeric(df["ask_price"], errors="coerce")
     df["mid"] = (df["bid"] + df["ask"]) / 2.0
     df["strike"] = df["option_strike_price"]
+    df["ks_ratio"] = df["option_strike_price"] / df["spot"]
     return df
 
 
@@ -337,7 +338,7 @@ def ensure_runtime_deps(*, upgrade_futu: bool = True, install_pyarrow: bool = Tr
         ver = getattr(ft, "__version__", "unknown")
         raise RuntimeError(
             f"futu-api {ver} in {sys.executable} still lacks get_option_volatility. "
-            "Use Kernel → Restart, then re-run from cell 1."
+            "Use Kernel �?Restart, then re-run from cell 1."
         )
     return getattr(ft, "__version__", "unknown")
 
@@ -590,47 +591,68 @@ def compute_surface_features(df: pd.DataFrame, cfg: VolSurfaceConfig | None = No
 def build_iv_grid(
     df: pd.DataFrame,
     dte_grid: np.ndarray | None = None,
-    moneyness_grid: np.ndarray | None = None,
+    ks_grid: np.ndarray | None = None,
     max_dte: int = 60,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Interpolate IV onto a (DTE x K/S) mesh from OTM options only.
+
+    Uses OTM puts for strikes below spot (K/S < 1) and OTM calls for
+    strikes above spot (K/S > 1), with a small ATM buffer where both
+    types are included for a smooth interpolation across the smile.
+    """
     dte_grid = dte_grid if dte_grid is not None else np.array([7, 10, 14, 21, 30, 45, 60])
     dte_grid = dte_grid[dte_grid <= max_dte]
-    moneyness_grid = (
-        moneyness_grid if moneyness_grid is not None else np.linspace(0.85, 1.15, 13)
+    ks_grid = ks_grid if ks_grid is not None else np.linspace(0.85, 1.15, 13)
+
+    sub = df[np.isfinite(df["iv"]) & np.isfinite(df["dte"])].copy()
+    if "ks_ratio" not in sub.columns:
+        sub["ks_ratio"] = sub["option_strike_price"] / sub["spot"]
+
+    # OTM selection with ATM buffer: puts on left wing, calls on right wing
+    atm_half_width = 0.03
+    is_put = sub["option_type"].str.upper().str.contains("PUT")
+    is_call = sub["option_type"].str.upper().str.contains("CALL")
+    otm_mask = (
+        (sub["ks_ratio"] < 1.0 - atm_half_width) & is_put
+    ) | (
+        (sub["ks_ratio"] > 1.0 + atm_half_width) & is_call
+    ) | (
+        sub["ks_ratio"].between(1.0 - atm_half_width, 1.0 + atm_half_width)
     )
+    sub = sub[otm_mask]
 
-    points = df[["dte", "moneyness", "iv"]].dropna().to_numpy()
-    if len(points) < 4:
-        raise ValueError("Not enough option quotes to build IV grid.")
+    if len(sub) < 4:
+        raise ValueError("Not enough OTM option quotes to build IV grid.")
 
-    grid_dte, grid_mny = np.meshgrid(dte_grid, moneyness_grid, indexing="ij")
+    points = sub[["dte", "ks_ratio", "iv"]].dropna().to_numpy()
+    grid_dte, grid_ks = np.meshgrid(dte_grid, ks_grid, indexing="ij")
     iv_grid = interpolate.griddata(
         points[:, :2],
         points[:, 2],
-        (grid_dte, grid_mny),
+        (grid_dte, grid_ks),
         method="linear",
     )
     if np.isnan(iv_grid).any():
         iv_grid = interpolate.griddata(
             points[:, :2],
             points[:, 2],
-            (grid_dte, grid_mny),
+            (grid_dte, grid_ks),
             method="nearest",
         )
     iv_grid = np.clip(iv_grid, 1.0, 200.0)
-    return grid_dte, grid_mny, iv_grid
+    return grid_dte, grid_ks, iv_grid
 
 
 def dupire_local_vol(
     spot: float,
     grid_dte: np.ndarray,
-    grid_moneyness: np.ndarray,
+    grid_ks: np.ndarray,
     iv_grid: np.ndarray,
     r: float = 0.045,
 ) -> np.ndarray:
     """Dupire local vol (%) from an implied-vol grid."""
     t_years = np.maximum(grid_dte / TRADING_DAYS, 1 / TRADING_DAYS)
-    strike_grid = grid_moneyness * spot
+    strike_grid = grid_ks * spot
     call_grid = bs_call_price(spot, strike_grid, t_years, r, iv_grid / 100.0)
 
     t_axis = t_years[:, 0]
@@ -693,14 +715,32 @@ def build_iv_grid_delta(
     dte_grid: np.ndarray | None = None,
     max_dte: int = 60,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Interpolate IV onto a (DTE × delta) mesh from the option chain."""
+    """Interpolate IV onto a (DTE x delta) mesh, OTM put/call + ATM buffer.
+
+    Uses OTM puts (delta < 0) for the left wing and OTM calls (delta > 0)
+    for the right wing, with a small ATM buffer for smooth interpolation.
+    """
     dte_grid = dte_grid if dte_grid is not None else np.array([7, 10, 14, 21, 30, 45, 60])
     dte_grid = dte_grid[dte_grid <= max_dte]
     delta_grid = delta_grid if delta_grid is not None else np.linspace(-0.5, 0.5, 21)
 
     sub = df[np.isfinite(df["iv"]) & np.isfinite(df["delta"]) & np.isfinite(df["dte"])].copy()
+
+    # OTM selection: puts on left wing (delta < 0), calls on right wing (delta > 0), ATM buffer
+    atm_half_width = 0.03
+    is_put = sub["option_type"].str.upper().str.contains("PUT")
+    is_call = sub["option_type"].str.upper().str.contains("CALL")
+    otm_mask = (
+        (sub["delta"] < -atm_half_width) & is_put
+    ) | (
+        (sub["delta"] > atm_half_width) & is_call
+    ) | (
+        sub["delta"].abs() <= atm_half_width
+    )
+    sub = sub[otm_mask]
+
     if len(sub) < 4:
-        raise ValueError("Not enough option quotes to build delta IV grid.")
+        raise ValueError("Not enough OTM option quotes to build delta IV grid.")
 
     points = sub[["dte", "delta", "iv"]].to_numpy()
     grid_dte, grid_delta = np.meshgrid(dte_grid, delta_grid, indexing="ij")
@@ -901,7 +941,7 @@ def deepseek_study_conclusion(
                 "role": "system",
                 "content": (
                     "You are an equity derivatives strategist. Write a concise plain-English conclusion "
-                    "as bullet points (4–7 lines, each starting with '- '). Cover vol level, put/call skew "
+                    "as bullet points (4�? lines, each starting with '- '). Cover vol level, put/call skew "
                     "shift, sentiment, and any local-vol anomalies. Use only supplied facts. "
                     "No section headings or numbered lists."
                 ),
@@ -998,7 +1038,7 @@ def build_study_conclusion(
         f"Put/call skew: spread {today_stats.get('put_call_spread', np.nan):+.1f} vol pts in band; {skew_tilt}."
     )
     bullets.append(
-        f"Sentiment — fear: {sentiment.get('fear', '').replace(chr(8212), '-')}; "
+        f"Sentiment �?fear: {sentiment.get('fear', '').replace(chr(8212), '-')}; "
         f"calls: {sentiment.get('call_opportunity', '').replace(chr(8212), '-')}; "
         f"event: {sentiment.get('event_risk', '').replace(chr(8212), '-')}."
     )
@@ -1008,7 +1048,7 @@ def build_study_conclusion(
     if n_ml or n_lv:
         bullets.append(
             f"Local-vol diagnostics: {n_ml} ML IV outlier(s), {n_lv} local-vol spike(s) "
-            f"— check for stale quotes or event pockets."
+            f"�?check for stale quotes or event pockets."
         )
     else:
         bullets.append("Local-vol diagnostics: no extreme ML IV outliers or local-vol spikes.")
@@ -1133,7 +1173,7 @@ def plot_single_delta_surface(
     local: bool = False,
     title: str = "",
 ) -> Any:
-    """One 3D surface on delta × DTE — IV or Dupire local vol."""
+    """One 3D surface on delta × DTE �?IV or Dupire local vol."""
     try:
         import plotly.graph_objects as go
     except ImportError as exc:
@@ -1195,7 +1235,7 @@ def plot_surface_decomposition(
     *,
     today_label: str,
     prev_label: str,
-    title: str = "IV surface change (today − previous session)",
+    title: str = "IV surface change (today �?previous session)",
 ) -> Any:
     """3D decomposition: IV change from previous business day to today."""
     try:
@@ -1462,25 +1502,25 @@ def classify_sentiment(
         call_opportunity_score += 1
 
     if fear_score >= 3:
-        fear_label = "elevated — downside protection being bid"
+        fear_label = "elevated �?downside protection being bid"
     elif fear_score >= 1:
-        fear_label = "moderate — some hedging demand"
+        fear_label = "moderate �?some hedging demand"
     else:
-        fear_label = "calm — limited crash-insurance premium"
+        fear_label = "calm �?limited crash-insurance premium"
 
     if call_opportunity_score >= 2 and fear_score <= 1:
-        call_label = "favorable — upside vol relatively cheap vs puts"
+        call_label = "favorable �?upside vol relatively cheap vs puts"
     elif call_opportunity_score >= 1:
-        call_label = "mixed — selective call structures may work"
+        call_label = "mixed �?selective call structures may work"
     else:
-        call_label = "cautious — calls not clearly cheap vs hedging demand"
+        call_label = "cautious �?calls not clearly cheap vs hedging demand"
 
     if anomalies.get("event_hump"):
         event_label = f"event priced near {anomalies['hump_dte']:.0f}d (IV hump)"
     elif today.get("term_slope", 0) > 2:
-        event_label = "front-end IV elevated — near-term stress"
+        event_label = "front-end IV elevated �?near-term stress"
     elif today.get("term_slope", 0) < -2:
-        event_label = "inverted term structure — immediate concern"
+        event_label = "inverted term structure �?immediate concern"
     else:
         event_label = "no dominant event hump in term structure"
 
@@ -1546,7 +1586,7 @@ def fetch_anchor_iv_histories(
     if not futu_anchor_iv_supported():
         ver = getattr(ft, "__version__", "unknown")
         warnings.warn(
-            f"futu-api {ver} has no get_option_volatility — anchor IV history skipped. "
+            f"futu-api {ver} has no get_option_volatility �?anchor IV history skipped. "
             "Upgrade in your notebook kernel: pip install -U futu-api",
             stacklevel=2,
         )
@@ -1665,7 +1705,7 @@ def format_anchor_commentary(anchor_ctx: dict[str, Any]) -> list[str]:
         else:
             direction = "stable skew"
         lines.append(
-            f"- **Skew proxy** (25Δ put − 30d ATM call): window change {skew_chg:+.1f} vol pts → {direction}"
+            f"- **Skew proxy** (25Δ put �?30d ATM call): window change {skew_chg:+.1f} vol pts �?{direction}"
         )
     lines.append("Note: each series tracks one fixed contract; DTE/moneyness drift over the window.")
     return lines
@@ -1799,8 +1839,9 @@ def generate_demo_surfaces(cfg: VolSurfaceConfig | None = None, n_days: int = 6)
                             "dte": dte,
                             "spot": spot,
                             "moneyness": spot / strike if opt_type == "CALL" else strike / spot,
-                            "log_moneyness": log_m,
-                            "iv": iv,
+                           "log_moneyness": log_m,
+                            "ks_ratio": strike / spot,
+                           "iv": iv,
                             "option_implied_volatility": iv,
                             "delta": delta,
                             "option_delta": delta,
@@ -1861,7 +1902,7 @@ class VolSurfaceStudy:
         self.surfaces = load_surface_history(self.cfg, self.cfg.lookback_days)
         if not self.surfaces and use_demo_if_empty:
             warnings.warn(
-                "No cached surfaces — loading demo SPX surfaces.",
+                "No cached surfaces �?loading demo SPX surfaces.",
                 stacklevel=2,
             )
             self.surfaces = generate_demo_surfaces(self.cfg, n_days=self.cfg.lookback_days + 1)
@@ -1934,7 +1975,7 @@ class VolSurfaceStudy:
             ax.plot(dtes, curve, marker="o", label=label, linewidth=lw)
         ax.set_xlabel("Days to expiry")
         ax.set_ylabel("ATM IV (%)")
-        ax.set_title(f"{self.cfg.underlying} — ATM term structure")
+        ax.set_title(f"{self.cfg.underlying} �?ATM term structure")
         ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3)
         return ax
@@ -1961,7 +2002,7 @@ class VolSurfaceStudy:
         if not self.local_vols:
             self.load_history()
         asof = asof or sorted(self.local_vols.keys())[-1]
-        grid_dte, grid_mny, _ = self.grids[asof]
+        grid_dte, grid_ks, _ = self.grids[asof]
         lv = self.local_vols[asof]
         if ax is None:
             _, ax = plt.subplots(figsize=(10, 5))
@@ -1969,13 +2010,13 @@ class VolSurfaceStudy:
             lv.T,
             aspect="auto",
             origin="lower",
-            extent=[grid_dte.min(), grid_dte.max(), grid_mny.min(), grid_mny.max()],
+            extent=[grid_dte.min(), grid_dte.max(), grid_ks.min(), grid_ks.max()],
             cmap="magma",
         )
         plt.colorbar(im, ax=ax, label="Local vol (%)")
         ax.set_xlabel("Days to expiry")
-        ax.set_ylabel("Moneyness (K/S approx)")
-        ax.set_title(f"Dupire local vol — {asof}")
+        ax.set_ylabel("K/S (strike/spot)")
+        ax.set_title(f"Dupire local vol �?{asof}")
         return ax
 
     def plot_anchor_iv_history(self, anchor_ctx: dict[str, Any], ax: plt.Axes | None = None) -> plt.Axes:
@@ -2028,7 +2069,7 @@ class VolSurfaceStudy:
         self.plot_anchor_iv_history(result["anchor_context"], ax=axes[0, 1])
         self.plot_local_vol_heatmap(ax=axes[1, 0])
         self.plot_vix_context(result["vix_context"], ax=axes[1, 1])
-        fig.suptitle(f"Vol surface study — {self.cfg.underlying} (≤{self.cfg.max_dte}d)", fontsize=13)
+        fig.suptitle(f"Vol surface study �?{self.cfg.underlying} (≤{self.cfg.max_dte}d)", fontsize=13)
         fig.tight_layout()
         plt.show()
 
@@ -2088,14 +2129,14 @@ class VolSurfaceStudy:
             "grid_delta": d_full,
             "z": iv_full,
             "local": False,
-            "title": f"IV — {today_d} ({full_label})",
+            "title": f"IV �?{today_d} ({full_label})",
         }
         views[(True, True)] = {
             "grid_dte": g_full,
             "grid_delta": d_full,
             "z": lv_full,
             "local": True,
-            "title": f"Local vol — {today_d} ({full_label})",
+            "title": f"Local vol �?{today_d} ({full_label})",
         }
 
         g_zoom, d_zoom, iv_zoom, lv_zoom = self.build_delta_surface(
@@ -2111,14 +2152,14 @@ class VolSurfaceStudy:
             "grid_delta": d_zoom,
             "z": iv_zoom,
             "local": False,
-            "title": f"IV — {today_d} ({zoom_label})",
+            "title": f"IV �?{today_d} ({zoom_label})",
         }
         views[(False, True)] = {
             "grid_dte": g_zoom,
             "grid_delta": d_zoom,
             "z": lv_zoom,
             "local": True,
-            "title": f"Local vol — {today_d} ({zoom_label})",
+            "title": f"Local vol �?{today_d} ({zoom_label})",
         }
         return views
 
@@ -2186,7 +2227,7 @@ class VolSurfaceStudy:
             iv_g,
             lv,
             title=(
-                f"IV & local vol — {today_d} "
+                f"IV & local vol �?{today_d} "
                 f"(δ∈[{full_delta[0]:+.2f},{full_delta[1]:+.2f}], ≤{self.cfg.max_dte}d)"
             ),
         )
@@ -2199,7 +2240,7 @@ class VolSurfaceStudy:
             z_iv,
             z_lv,
             title=(
-                f"IV & local vol — {today_d} "
+                f"IV & local vol �?{today_d} "
                 f"(zoom δ∈[{zoom_delta[0]:+.1f},{zoom_delta[1]:+.1f}], DTE<{zoom_max_dte}d)"
             ),
         )
