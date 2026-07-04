@@ -44,10 +44,7 @@ from vol_surface import (
     save_surface,
 )
 
-try:
-    import futu as ft
-except ImportError:
-    ft = None
+import futu as ft
 
 logger = logging.getLogger(__name__)
 

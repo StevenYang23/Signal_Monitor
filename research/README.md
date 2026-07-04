@@ -1,132 +1,87 @@
-# Volatility Regime Methodology
+# Quantitative Volatility Research Studies / 波动率量化研究库
 
-This research studies whether major US equity indices can be separated into two practical market regimes:
+This research folder houses two major quantitative studies on US stock indices (SPX, DJI, NDX) focusing on volatility surface structure and macro volatility regime analysis.
 
-- **Low-vol / slow-bull regime:** lower realized and implied volatility, positive trend, smaller drawdowns, and fewer daily direction changes.
-- **High-vol / choppy regime:** higher volatility, larger drawdowns, weaker or unstable trend, and more frequent up/down price swings.
+本研究目录包含针对美股大盘指数（SPX、DJI、NDX）的两大波动率核心研究，分别解决“日内/跨期波动率曲面瞬时结构”与“中长期宏观波动率机制过滤”两大问题。
 
-The notebook `vol_regime_study.ipynb` is a self-contained walkthrough aligned with `regime_study_v2.ipynb`: download data, build `lagged_VRP`, run a daily walk-forward HMM, backtest a long-only rule, and plot results. A reusable class implementation lives in `volatility_regime.py` at the repo root for production-style workflows (`SPX_signal.ipynb`) and optional feature-set ablation.
+---
 
-## Notebook Structure
+## Interactive Studies Overview / 研究概述
 
-`vol_regime_study.ipynb` has four code cells:
+1. **Option Volatility Surface & PCA Delta Sentiment / 期权波动率曲面与 Delta 主成分分类情绪研究**:
+   - **File / 对应文件:** [vol_surface_study.ipynb](vol_surface_study.ipynb)
+   - **Core Focus / 核心要点:** Ingests options chain matrices, interpolates continuous Implied Volatility grids over Moneyness ($K/S$) and Tenor ($DTE$), applies Dupire's PDE solver for 3D Local Volatility mapping, and reduces option delta changes via PCA to build a real-time Compass Bull/Bear Speedometer.
+   - 解析多维度期权链矩阵，在偏离度（Moneyness）与期限双维度网格上插值出隐含波动率曲面，利用 Dupire 局部波动率偏微分方程提取瞬时局部波动率网格。同时，对曲面每日德尔塔（Delta）特征变动进行 PCA 主成分降维，构建牛熊极值情绪时速指标。
 
-1. **Download data** — pull daily closes from Yahoo Finance for SPX, DJI, and NSDQ with their vol indices.
-2. **Feature engineering** — build `lagged_VRP` only (plus price/vol columns for plots).
-3. **Training** — daily walk-forward HMM; fit on prior 2 years excluding today; score today OOS.
-4. **Display** — three-panel charts (price, IV, cumulative log-return strategy vs buy-and-hold).
+2. **HMM Volatility Regime Transition Filters / 基于 HMM 的滚动 walk-forward 机制切换研究**:
+   - **File / 对应文件:** [vol_regime_study.ipynb](vol_regime_study.ipynb)
+   - **Core Focus / 核心要点:** Designs a daily walk-forward walk (rolling fit) Gaussian Hidden Markov Model (HMM) on the index's **lagged Volatility Risk Premium (`lagged_VRP`)**. Generates out-of-sample (OOS) state probabilities to identify low-volatility calm regimes and high-volatility turbulent regimes, backing it up with index trend-following long-only backtests.
+   - 利用指数**滞后波动率风险溢价（`lagged_VRP`）**作为单一特征，通过滚动 2 年（504 交易日）的滑动窗口日频拟合高斯 HMM。求得日频样本外低波平静期与高波恐慌期的条件状态概率。回测表明，该状态过滤器在避开重大回撤和提高夏普比率方面极具成效。
 
-## Data
+---
 
-Daily market data comes from Yahoo Finance (`yfinance`).
+## 1. Option Volatility Surface & Dupire Local Vol / 波动率曲面与 Dupire 局部波
 
-| Label | Underlying | Implied vol |
-|-------|------------|-------------|
-| SPX   | `^SPX`     | `^VIX`      |
-| DJI   | `^DJI`     | `^VXD`      |
-| NSDQ  | `^NDX`     | `^VXN`      |
+Implied volatility (IV) extracted from options varies across strikes (skew/smile) and maturities (term structure). Continuous smoothing allows us to model a regular 3D surface. Under the risk-neutral measure, Dupire's formula relates the local volatility ($\sigma_{\text{local}}$) directly to the partial derivatives of European option prices, or equivalently, the implied volatility surface:
 
-**Inner join on dates:** underlying and vol series are merged with `join="inner"` so holiday mismatches (e.g. VIX row without SPX) do not corrupt rolling features.
+期权链提取出的隐含波动率随行权价（偏斜/微笑）和到期期限（期限结构）变动。通规则的双维插值可以拟合出完整的 3D 隐含波曲面。在风险中性测度下，Dupire 局部波动率（$\sigma_{\text{local}}$）求解器直接代入隐含波的一阶、二阶偏导，求解出瞬时标的资产处的局部风险水平：
 
-Key parameters:
+$$\sigma_{\text{local}}^2(K, T) = \frac{\frac{\partial C}{\partial T} + r K \frac{\partial C}{\partial K}}{\frac{1}{2} K^2 \frac{\partial^2 C}{\partial K^2}}$$
 
-- `DATA_PERIOD`: `"max"`
-- `LIVE_START`: backtest start in the notebook (e.g. `2015-01-01`; `volatility_regime.train()` default is `2000-01-01`)
-- `LIVE_END`: backtest end (`None` = latest available in notebook)
-- `TRADING_DAYS`: `252`
+In [vol_surface_study.ipynb](vol_surface_study.ipynb), are generated:
+- **Bloomberg-Style 3D Volatility Mesh / 3D 隐含与局部波格点图**:
+  ![Vol Surface](../demo/vol_surface.png)
+- **Moneyness-Based IV Contour Grid / 行权价偏离度（Moneyness）与期限隐含波连续热力图**:
+  ![IV Surface](../demo/IV_surface.png)
 
-## Feature Engineering
+From these structural matrices, we perform PCA via [../surface_sentiment.py](../surface_sentiment.py) to map deformations. Combining Level shifts (PC1) and Twist/Slope shifts (PC2) with basic indicators (skew, slope, VIX), we output the consolidated **Compass Sentiment Speedometer Gauge**:
 
-The HMM uses a single input, **`lagged_VRP`**, matching `regime_study_v2.ipynb`:
+通过对差值后的斜率差动态德尔塔（Delta）特征进行主成分降维（PCA），结合 PC1（水平移动）、PC2（扭曲移动）、ATM Skew、Term Slope 和 VIX 绝对水位，输入至集成时速算法，输出 **罗盘牛熊情绪时速表**：
 
-```text
-IV           = VOL                         # implied vol, annualized %
-RV_22        = rolling_std(log_return, 22) * sqrt(252) * 100
-lagged_VRP   = IV.shift(22) - RV_22
+![Compass](../demo/Compass.png)
+
+---
+
+## 2. HMM-based Volatility Regime Shading / 隐马模型机制过滤器
+
+To implement the long-term trend filter analyzed in [vol_regime_study.ipynb](vol_regime_study.ipynb), we define:
+
+为实现中长线防回撤的平滑过滤，我们在 [vol_regime_study.ipynb](vol_regime_study.ipynb) 中定义：
+
+- **Realized Volatility ($RV_{22}$):** Annualized rolling 22-day standard deviation of index log returns.
+- **Lagged Volatility Risk Premium ($lagged\_VRP$):** $IV_{t-22} - RV_{22, t}$.
+
+- **已实现波动率（$RV_{22}$）:** 标的指数 22 交易日的滚动对数年化标准差。
+- **滞后波动率风险溢价（$lagged\_VRP$）:** 22 天前的平价隐含波与当前已实现波动的差值：$IV_{t-22} - RV_{22, t}$。
+
+A Two-State Gaussian HMM is fit on a rolling 504-day (2-year) windows ending at $t-1$. We evaluate today's OOS posterior state probability $P(\text{low today} \ge 0.5)$ and the future projection probability $P(\text{low tomorrow} \ge 0.5)$ to filter whipsaws:
+
+在滚动 504 交易日的窗口上，以每日 $t-1$ 之前的数据拟合状态，提取今日样本外后验平静状态概率 $P(\text{low today})$ 与结合转移概率得出的明日预测概率 $P(\text{low tomorrow})$，当两者同时 $\ge 0.5$ 时发出多头信号：
+
+```python
+signal_today = int((prob_low_vol >= 0.5) and (prob_low_vol_tmr >= 0.5))
 ```
 
-`IV` and `RV_22` share the same percent units (e.g. VIX ≈ 17 lines up with RV_22 ≈ 15).
+This successfully shades turbulent high-volatility crash regimes in red:
 
-## Regime Methods
+该分类器在历史回测中表现出其显著的避险与染色特征，红色区域代表识别出的高波震荡/危机时期：
 
-Two-state Gaussian HMM (`hmmlearn`), daily walk-forward:
+![Regime Shading](../demo/SPX_regime.png)
 
-| Parameter | Default |
-|-----------|---------|
-| `train_window` | `504` (2 years) |
-| `refit_step` | `1` (daily refit) |
-| `threshold_today` / `threshold_tomorrow` | `0.5` |
-| `hmm_n_iter` | `500` |
-| `hmm_tol` | `1e-1` |
-| `transmat_prior` | `1.0` |
+Applying this regime filter in a diagnostic long-only trading backtest results in substantial outperformance, reducing max drawdown and significantly increasing cumulative returns:
 
-**Training (each day):**
+将这一波动率机制信号代入只做多/平仓的诊断性策略，可取得超越大盘（S&P 500、道琼斯、纳斯达克 100）的稳健净值曲线：
 
-- Fit on `iloc[loc - 504 : loc]` — prior 2 years, **today excluded**.
-- Score today OOS with `predict_proba` on `iloc[loc - 503 : loc + 1]`; take the last row.
+![Strategy Performance](../demo/SPX_signal.png)
 
-**State labeling:** lower HMM mean on `lagged_VRP` → low-vol (calm) state.
+---
 
-**Trade signal:**
+## Module Code Integration / 核心脚本联动
 
-```text
-signal = (prob_low_vol >= 0.5) & (prob_low_vol_tmr >= 0.5)
-```
+- Use [vol_surface_study.ipynb](vol_surface_study.ipynb) to study options surface dynamics and run interactive plots. Reusable production methods are in [../vol_surface.py](../vol_surface.py) and [../surface_sentiment.py](../surface_sentiment.py).
+- Use [vol_regime_study.ipynb](vol_regime_study.ipynb) for retro backtest evaluation of the walk-forward classification engine. Live production-grade rolling predictions are served by [../volatility_regime.py](../volatility_regime.py).
+- Local Web monitoring visual interface is fully integrated inside [../app.py](../app.py).
 
-`prob_low_vol_tmr` uses the fitted transition matrix (one-step-ahead low-vol probability).
-
-## Today's signal (live vs backtest)
-
-Two workflows share the **same per-day scoring math** but differ in how often the model is refit:
-
-| | `vol_regime_study.ipynb` | `volatility_regime.py` (`SPX_signal`) |
-|---|--------------------------|----------------------------------------|
-| Purpose | Historical backtest | Live monitor |
-| Refit | Every trading day | Once per `display()` / `fit_once()` |
-| Data fetch | Full history (`max`) | ~2.5y (`630d` in `signal_mode`) |
-| Today's row | Last day of walk-forward loop | `fit_once(exclude_today=True)` |
-
-**Per-day scoring (identical in both):**
-
-1. Fit HMM on `lagged_VRP` for the prior **504 days**, ending yesterday.
-2. Run `predict_proba` on the **504-day window ending today**; take the last row.
-3. Map states: lower Gaussian mean → low-vol.
-4. `signal = 1` iff `P(low today) ≥ 0.5` **and** `P(low tomorrow) ≥ 0.5`.
-
-`fit_once()` produces the same probabilities as the notebook's last backtest day when run on the same prices (verified on SPX).
-
-**Interpretation:** at today's close, the signal answers whether to be long **tomorrow**, using only information available through today. PnL in the notebook applies `signal[t]` to `return[t → t+1]`.
-
-**`display()`** updates only **today's** SPX/VIX quotes on repeat calls (initial call downloads ~2.5y history), then runs `fit_once()`.
-
-## Strategy PnL
-
-Long-only diagnostic backtest:
-
-- Long when `signal = 1`; flat otherwise.
-- PnL uses **next-day log return**: `log(price_{t+1} / price_t)` applied to the signal at `t`.
-- Charts show cumulative log return; no transaction costs.
-
-## Display
-
-Per market, three panels:
-
-1. Underlying price with high-vol periods (`signal = 0`) shaded red.
-2. IV and 22-day realized vol (both annualized %).
-3. Cumulative log return: regime strategy vs buy-and-hold.
-
-Signals are saved under `research/Saved_Signal/regime_{market}.csv`.
-
-## Relation to `volatility_regime.py`
-
-`HMMVolatilityRegime` implements the same methodology as `vol_regime_study.ipynb`:
-
-- Inner-join price/vol download; `lagged_VRP` formula above.
-- Defaults: `train_window=504`, `refit_step=1`, thresholds `0.5`, `live_start="2000-01-01"`.
-- `train()` — full walk-forward backtest over `live_start`…`live_end`.
-- `fit_once(exclude_today=True)` — fit on prior 504 days, score latest bar OOS.
-- `display(display_period=22)` — update **today's** SPX/VIX only (full download on first call), then `fit_once` and plot.
-- `from_market("SPX", signal_mode=True)` — auto-sets `data_period="630d"` (~2.5y fetch for 2y fit + warm-up).
-- `add_strategy_pnl()`, `return_summary()`, `plot()`, `evaluate_feature_sets()` for extended experiments.
-
-Use the notebook for multi-market research plots. Use `volatility_regime.py` for daily signal generation and class-based workflows.
+- 使用 [vol_surface_study.ipynb](vol_surface_study.ipynb) 进行波动曲面、局部波方程插值和 PCA 情绪特征调试，封装模块位于 [../vol_surface.py](../vol_surface.py) 与 [../surface_sentiment.py](../surface_sentiment.py)。
+- 使用 [vol_regime_study.ipynb](vol_regime_study.ipynb) 进行 HMM 滚动分类机制在各指数下的历史回测和多特征比对，封装模块位于 [../volatility_regime.py](../volatility_regime.py)。
+- 本地 Web 交互与实时信号展现集中在根目录下的核心可视化程序 [../app.py](../app.py) 中。

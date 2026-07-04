@@ -11,10 +11,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-try:
-    from hmmlearn.hmm import GaussianHMM
-except ImportError:
-    GaussianHMM = None
+from hmmlearn.hmm import GaussianHMM
 
 
 class HMMVolatilityRegime:

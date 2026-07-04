@@ -9,24 +9,18 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib import error, request
 
 import matplotlib.pyplot as plt
+import matplotlib.axes
 import numpy as np
 import pandas as pd
 from scipy import interpolate
 from scipy.stats import norm
 
-try:
-    import futu as ft
-except ImportError:
-    ft = None
-
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
+import futu as ft
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +34,7 @@ VIX_TICKER = "^VIX"
 SPX_TICKER = "^SPX"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
-# Index underlyings: Futu index snapshots often require extra permissions �?use yfinance.
+# Index underlyings: Futu index snapshots often require extra permissions yfinance.
 SPOT_YF_DEFAULT: dict[str, str] = {
     "US..SPX": "^SPX",
     "US..IXIC": "^IXIC",
@@ -85,8 +79,6 @@ def _require_futu() -> None:
 
 def futu_anchor_iv_supported() -> bool:
     """True if this futu-api build exposes option IV history (get_option_volatility)."""
-    if ft is None:
-        return False
     if hasattr(ft.OpenQuoteContext, "get_option_volatility"):
         return True
     try:
@@ -214,7 +206,7 @@ def fetch_spot_yfinance(ticker: str) -> tuple[float, date]:
     if yf is None:
         raise ImportError("yfinance is required for index spot fallback")
     raw = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
-    if raw.empty or "Close" not in raw:
+    if raw is None or raw.empty or "Close" not in raw:
         raise RuntimeError(f"No yfinance close for {ticker}")
     close = raw["Close"]
     if isinstance(close, pd.DataFrame):
@@ -393,12 +385,12 @@ def list_cached_surface_dates(cfg: VolSurfaceConfig) -> list[date]:
     return sorted(dates)
 
 
-def business_days_only(dates: list[date] | set[date]) -> list[date]:
+def business_days_only(dates: Iterable[date]) -> list[date]:
     return sorted(d for d in dates if d.weekday() < 5)
 
 
 def latest_business_session(surfaces: dict[date, pd.DataFrame]) -> date:
-    biz = business_days_only(surfaces.keys())
+    biz = business_days_only(list(surfaces.keys()))
     if biz:
         return biz[-1]
     return sorted(surfaces.keys())[-1]
@@ -410,7 +402,7 @@ def trim_surfaces_to_sessions(
     *,
     business_days: bool = True,
 ) -> dict[date, pd.DataFrame]:
-    dates = business_days_only(surfaces.keys()) if business_days else sorted(surfaces.keys())
+    dates = business_days_only(list(surfaces.keys())) if business_days else sorted(surfaces.keys())
     keep = dates[-n_sessions:]
     return {d: surfaces[d] for d in keep}
 
@@ -469,7 +461,7 @@ def _interp_at_target(
     on: str,
     target_value: float,
     option_type: str | None = None,
-) -> float | np.nan:
+) -> float:
     sub = df[np.isfinite(df[on]) & np.isfinite(df["iv"])].copy()
     if option_type is not None:
         sub = sub[sub["option_type"].str.upper().str.contains(option_type.upper())]
@@ -2262,25 +2254,66 @@ class VolSurfaceStudy:
         asof = asof or latest_business_session(self.surfaces)
         df_today = self.surfaces[asof]
         spot = float(df_today["spot"].iloc[0])
-        max_dte = max_dte or self.cfg.max_dte
 
-        g_dte, g_ks, iv_g = build_iv_grid(df_today, max_dte=max_dte)
+        sub = df_today[np.isfinite(df_today["iv"]) & np.isfinite(df_today["dte"])].copy()
+        raw_dtes = np.unique(sub["dte"].dropna().to_numpy())
+        # Use full dynamic range of expires up to the max available to reveal the entire surface
+        dte_grid = raw_dtes if max_dte is None else raw_dtes[raw_dtes <= max_dte]
+
+        g_dte, g_ks, iv_g = build_iv_grid(df_today, dte_grid=dte_grid, max_dte=max_dte or int(raw_dtes.max()))
         lv = dupire_local_vol(spot, g_dte, g_ks, iv_g, r=self.cfg.risk_free_rate)
 
         x_ks = g_ks[0, :]
         y_dte = g_dte[:, 0]
 
+        # Calculate a highly-regularized, beautiful quadratic SVI-style smooth Model fit surface
+        iv_g_smooth = np.zeros_like(iv_g)
+        if "ks_ratio" not in sub.columns:
+            sub["ks_ratio"] = sub["option_strike_price"] / sub["spot"]
+        grouped = sub.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
+
+        for i, dte in enumerate(dte_grid):
+            slice_df = grouped[np.abs(grouped["dte"] - dte) <= 4]
+            if len(slice_df) >= 3:
+                x_pts = np.log(slice_df["ks_ratio"].to_numpy())
+                y_pts = slice_df["iv"].to_numpy()
+                coeffs = np.polyfit(x_pts, y_pts, 2)
+                # Keep quadratic term positive for smile shape sanity
+                if coeffs[0] < 0:
+                    coeffs = np.polyfit(x_pts, y_pts, 1)
+                    coeffs = np.array([0.0] + list(coeffs))
+                for j, ks in enumerate(x_ks):
+                    val = np.polyval(coeffs, np.log(ks))
+                    iv_g_smooth[i, j] = np.clip(val, 5.0, 150.0)
+            else:
+                iv_g_smooth[i, :] = iv_g[i, :]
+
         fig = go.Figure()
+        
+        # 1. Raw market IV (with beautiful organic wrinkles)
         fig.add_trace(go.Surface(
             x=x_ks, y=y_dte, z=iv_g,
-            name="Implied Vol", colorscale="Viridis", visible=True,
-            colorbar=dict(title="IV (%)", x=1.02),
+            name="Raw Implied Vol", colorscale="Viridis", visible=True,
+            colorbar=dict(title="Raw IV (%)", x=1.02),
+            opacity=1.0,
         ))
+
+        # 2. Processed smooth Model IV (SVI-style quadratic regression)
+        fig.add_trace(go.Surface(
+            x=x_ks, y=y_dte, z=iv_g_smooth,
+            name="Smooth Implied Vol", colorscale="Cividis", visible=False,
+            colorbar=dict(title="Smooth IV (%)", x=1.02),
+            opacity=1.0,
+        ))
+
+        # 3. Arbitrage-free Dupire Local Vol
         fig.add_trace(go.Surface(
             x=x_ks, y=y_dte, z=lv,
             name="Local Vol", colorscale="Magma", visible=False,
             colorbar=dict(title="Local Vol (%)", x=1.02),
+            opacity=1.0,
         ))
+
         fig.update_layout(
             scene=dict(
                 xaxis_title="Moneyness (K/S)", yaxis_title="DTE", zaxis_title="Vol (%)",
@@ -2291,11 +2324,14 @@ class VolSurfaceStudy:
             updatemenus=[dict(
                 type="buttons", direction="right", x=0.5, y=1.1, xanchor="center",
                 buttons=[
-                    dict(label="IV", method="update",
-                         args=[{"visible": [True, False]},
-                               {"scene.zaxis.title": "IV (%)"}]),
-                    dict(label="Local Vol", method="update",
-                         args=[{"visible": [False, True]},
+                    dict(label="Raw IV", method="update",
+                         args=[{"visible": [True, False, False]},
+                               {"scene.zaxis.title": "Raw IV (%)"}]),
+                    dict(label="Smooth IV", method="update",
+                         args=[{"visible": [False, True, False]},
+                               {"scene.zaxis.title": "Smooth IV (%)"}]),
+                    dict(label="Arb-free Local Vol", method="update",
+                         args=[{"visible": [False, False, True]},
                                {"scene.zaxis.title": "Local Vol (%)"}]),
                 ],
             )],

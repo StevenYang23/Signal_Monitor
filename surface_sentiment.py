@@ -27,12 +27,8 @@ from vol_surface import (
     latest_business_session,
 )
 
-try:
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-except ImportError:
-    PCA = None
-    StandardScaler = None
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
