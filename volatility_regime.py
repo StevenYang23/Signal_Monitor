@@ -45,8 +45,8 @@ class HMMVolatilityRegime:
 
     MARKETS = {
         "SPX": {"underly": "^SPX", "vol": "^VIX"},
-        "DJI": {"underly": "^DJI", "vol": "^VXD"},
-        "NSDQ": {"underly": "^NDX", "vol": "^VXN"},
+        "DJI": {"underly": "DIA", "vol": "^VXD"},
+        "NSDQ": {"underly": "QQQ", "vol": "^VXN"},
     }
 
     CRISIS_WINDOWS = [

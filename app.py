@@ -62,6 +62,31 @@ class QuantEngine:
                 iv_data = [[float(v) for v in row] for row in iv_g]
                 lv_data = [[float(v) for v in row] for row in lv]
 
+                # Calculate smooth IV (SVI-style quadratic regression)
+                sub_today = df_today[np.isfinite(df_today["iv"]) & np.isfinite(df_today["dte"])].copy()
+                if "ks_ratio" not in sub_today.columns:
+                    sub_today["ks_ratio"] = sub_today["option_strike_price"] / sub_today["spot"]
+                grouped = sub_today.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
+
+                iv_g_smooth = np.zeros_like(iv_g)
+                for i, dte in enumerate(y_dte):
+                    slice_df = grouped[np.abs(grouped["dte"] - dte) <= 4]
+                    if len(slice_df) >= 3:
+                        x_pts = np.log(slice_df["ks_ratio"].to_numpy())
+                        y_pts = slice_df["iv"].to_numpy()
+                        coeffs = np.polyfit(x_pts, y_pts, 2)
+                        # Keep quadratic term positive for smile shape sanity
+                        if coeffs[0] < 0:
+                            coeffs = np.polyfit(x_pts, y_pts, 1)
+                            coeffs = np.array([0.0] + list(coeffs))
+                        for j, ks in enumerate(x_ks):
+                            val = np.polyval(coeffs, np.log(ks))
+                            iv_g_smooth[i, j] = np.clip(val, 5.0, 150.0)
+                    else:
+                        iv_g_smooth[i, :] = iv_g[i, :]
+
+                sv_data = [[float(v) for v in row] for row in iv_g_smooth]
+
                 # Run PCA Decomposition
                 result = study.analyze()
                 today_f = result["today"]
@@ -105,7 +130,8 @@ class QuantEngine:
                 # 2. HMM Volatility Regime 
                 hmm_ticker_name = hmm_map[short_name]
                 hmm_model = HMMVolatilityRegime.from_market(hmm_ticker_name, signal_mode=True)
-                hmm_model.display(display_period=44)
+                hmm_model.download_data()
+                hmm_model.fit_once()
                 hmm_sig = hmm_model.today_signal
 
                 hmm_regime_str = "unknown"
@@ -113,6 +139,11 @@ class QuantEngine:
                 hmm_prob_tmr = 50.0
                 hmm_signal_bool = False
                 move_rows = []
+                hmm_history_dates = []
+                hmm_history_prices = []
+                hmm_history_rv = []
+                hmm_history_iv = []
+                hmm_history_regimes = []
 
                 if hmm_sig is not None:
                     hmm_regime_str = str(hmm_sig.get("hmm", "unknown"))
@@ -129,6 +160,18 @@ class QuantEngine:
                             "historical": str(move_table.loc[idx, "Historical"]),
                             "spot_implied": str(move_table.loc[idx, "Spot ± implied"])
                         })
+
+                    # Extract HMM history (last 44 business days)
+                    feats = hmm_model.features
+                    regs = hmm_model.regimes
+                    if feats is not None and regs is not None:
+                        aligned = feats.join(regs, how="inner").dropna(subset=["SPX", "RV_22", "IV", "hmm"])
+                        history_df = aligned.tail(44)
+                        hmm_history_dates = [d.strftime("%Y-%m-%d") for d in history_df.index]
+                        hmm_history_prices = [float(v) for v in history_df["SPX"]]
+                        hmm_history_rv = [float(v) for v in history_df["RV_22"]]
+                        hmm_history_iv = [float(v) for v in history_df["IV"]]
+                        hmm_history_regimes = [str(v) for v in history_df["hmm"]]
 
                 indices_data[short_name] = {
                     "exists": True,
@@ -149,12 +192,18 @@ class QuantEngine:
                     "surface_x": x_ks,
                     "surface_y": y_dte,
                     "surface_z": iv_data,
+                    "surface_sv": sv_data,
                     "surface_w": lv_data,
                     "hmm_regime": hmm_regime_str,
                     "hmm_prob_today": hmm_prob_today,
                     "hmm_prob_tmr": hmm_prob_tmr,
                     "hmm_signal": hmm_signal_bool,
-                    "hmm_move_table": move_rows
+                    "hmm_move_table": move_rows,
+                    "hmm_dates": hmm_history_dates,
+                    "hmm_prices": hmm_history_prices,
+                    "hmm_rv": hmm_history_rv,
+                    "hmm_iv": hmm_history_iv,
+                    "hmm_regimes": hmm_history_regimes
                 }
             except Exception as e:
                 print(f"Error processing index {short_name}: {e}")
@@ -191,7 +240,9 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 .main-layout{display:flex;flex:1;overflow:hidden;padding:16px;gap:16px;height:calc(100vh - 54px)}
 .panel{background:#131722;border-radius:8px;border:1px solid #1f2330;overflow:hidden;display:flex;flex-direction:column}
 .ptitle{font-size:11px;font-weight:600;padding:10px 16px;border-bottom:1px solid #1f2330;color:#8f96a3;text-transform:uppercase;letter-spacing:.8px}
-.surface-panel{flex:1.2;display:flex;flex-direction:column}
+.surface-panel{flex:1.4;display:flex;flex-direction:column}
+.left-col{flex:1.2;display:flex;flex-direction:column;gap:16px;height:100%}
+.price-regime-panel{flex:1.0;display:flex;flex-direction:column}
 .sidebar{flex:0.8;display:flex;flex-direction:column;gap:16px;overflow-y:auto;padding-right:4px}
 .controls{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid #1f2330;align-items:center}
 .controls label{font-size:11px;color:#8f96a3;font-weight:500}
@@ -234,16 +285,24 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 </div>
 
 <div class="main-layout">
-  <div class="panel surface-panel">
-    <div class="ptitle" id="surfaceTitle">Vol Surface - SPX</div>
-    <div class="controls">
-      <label>Mode:</label>
-      <div class="rg">
-        <button class="rb active" id="btnIV" onclick="setMode('iv')">Implied Vol</button>
-        <button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button>
+  <div class="left-col">
+    <div class="panel surface-panel">
+      <div class="ptitle" id="surfaceTitle">Vol Surface - SPX</div>
+      <div class="controls">
+        <label>Mode:</label>
+        <div class="rg">
+          <button class="rb active" id="btnRawIV" onclick="setMode('iv')">Raw IV</button>
+          <button class="rb" id="btnSmoothIV" onclick="setMode('sv')">Smooth IV</button>
+          <button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button>
+        </div>
       </div>
+      <div id="surfaceContainer" style="flex:1"></div>
     </div>
-    <div id="surfaceContainer" style="flex:1"></div>
+    
+    <div class="panel price-regime-panel">
+      <div class="ptitle" id="regimeTitle">Price & Volatility Regime Analysis - SPX</div>
+      <div id="regimeContainer" style="flex:1; min-height: 250px;"></div>
+    </div>
   </div>
 
   <div class="sidebar">
@@ -289,6 +348,11 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
       </div>
     </div>
 
+    <div class="panel price-regime-panel" style="flex: 1; min-height: 200px;">
+      <div class="ptitle">Volatility Historical Shading (RV vs IV)</div>
+      <div id="volHeatmapContainer" style="flex: 1; min-height: 200px;"></div>
+    </div>
+
     <div class="panel" style="flex: 1; min-height: 200px;">
       <div class="ptitle">Quantitative Structure Metrics</div>
       <div class="summary-content" id="bulletsBox"></div>
@@ -324,8 +388,22 @@ function renderAll() {
   document.getElementById('surfaceTitle').textContent = "Vol Surface - " + currentIdx;
 
   // 1. 3D Surface
-  const z = currentMode === 'iv' ? data.surface_z : data.surface_w;
-  const title = currentMode === 'iv' ? 'Implied Vol (%)' : 'Local Vol (%)';
+  let z;
+  let title;
+  let colorscale;
+  if (currentMode === 'iv') {
+    z = data.surface_z;
+    title = 'Raw Implied Vol (%)';
+    colorscale = 'Viridis';
+  } else if (currentMode === 'sv') {
+    z = data.surface_sv || data.surface_z;
+    title = 'Smooth Implied Vol (%)';
+    colorscale = 'Cividis';
+  } else {
+    z = data.surface_w;
+    title = 'Local Vol (%)';
+    colorscale = 'Magma';
+  }
   const rng = currentMode === 'lv' ? [0, Math.max(...z.flat())] : undefined;
   
   const plotlyData = [{
@@ -333,9 +411,9 @@ function renderAll() {
     x: data.surface_x,
     y: data.surface_y,
     z: z,
-    colorscale: 'RdYlBu_r',
+    colorscale: colorscale,
     hovertemplate: 'K/S (Moneyness): %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
-    colorbar: {title: 'Vol %', titleside: 'right', x: 0.88, len: 0.7},
+    colorbar: {title: title, titleside: 'right', x: 0.88, len: 0.7},
     contours: {z: {show: true, usecolormap: true, highlightcolor: 'lime', project: {z: true}}},
     cmin: rng && rng[0], cmax: rng && rng[1],
   }];
@@ -347,7 +425,7 @@ function renderAll() {
     scene: {
       xaxis: {title:'Moneyness (K/S)', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
       yaxis: {title:'DTE', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
-      zaxis: {title:'Vol (%)', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      zaxis: {title: title, gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
       camera: {eye: {x:-1.5, y:-1.5, z:0.8}},
       aspectmode: 'manual',
       aspectratio: {x:1.0, y:1.2, z:0.6}
@@ -362,36 +440,56 @@ function renderAll() {
   const angle = (score + 100) / 200 * 180;
   const rad = angle * Math.PI / 180;
   const r = 70, cx = 100, cy = 90;
-  const nx = cx + r * Math.sin(rad), ny = cy - r * Math.cos(rad);
-  const bearArc = "M " + (cx-r) + "," + cy + " A " + r + "," + r + " 0 0,0 " + cx + "," + (cy-r);
-  const bullArc = "M " + cx + "," + (cy-r) + " A " + r + "," + r + " 0 0,0 " + (cx+r) + "," + cy;
-  let ticksHtml = '';
-  [-100,-50,0,50,100].forEach(function(v) {
-    const a = (v + 100) / 200 * 180 * Math.PI / 180;
-    const tx = cx + (r + 8) * Math.sin(a);
-    const ty = cy - (r + 8) * Math.cos(a);
-    ticksHtml += '<span style="position:absolute;font-size:10px;color:#8f96a3;left:' + (tx+45) + 'px;top:' + (ty-2) + 'px;transform:translate(-50%,-50%)">' + v + '</span>';
+  const nx = cx - r * Math.cos(rad), ny = cy - r * Math.sin(rad);
+
+  // Define 5-tier colored gauge segments (Red, Orange, Yellow, Light Green, Green)
+  const segments = [
+    { start: -100, end: -50, color: "#e74c3c" },  // Far Left
+    { start: -50,  end: -15, color: "#e67e22" },  // Mid Left
+    { start: -15,  end: 15,  color: "#f1c40f" },  // Center Neutral
+    { start: 15,   end: 50,  color: "#2ecc71" },  // Mid Right
+    { start: 50,   end: 100, color: "#27ae60" }   // Far Right
+  ];
+
+  let svgPaths = "";
+  segments.forEach(seg => {
+    const startRad = (seg.start + 100) / 200 * Math.PI;
+    const endRad = (seg.end + 100) / 200 * Math.PI;
+    const sx = cx - r * Math.cos(startRad);
+    const sy = cy - r * Math.sin(startRad);
+    const ex = cx - r * Math.cos(endRad);
+    const ey = cy - r * Math.sin(endRad);
+    svgPaths += `<path d="M ${sx},${sy} A ${r},${r} 0 0,1 ${ex},${ey}" stroke="${seg.color}" stroke-width="12" fill="none" stroke-linecap="round" opacity="0.8"/>`;
+  });
+
+  // Calculate coordinates for Tick Labels using SVG <text> elements
+  let svgTexts = "";
+  [-100, -50, 0, 50, 100].forEach(v => {
+    const a = (v + 100) / 200 * Math.PI;
+    const tx = cx - (r + 14) * Math.cos(a);
+    const ty = cy - (r + 14) * Math.sin(a);
+    svgTexts += `<text x="${tx}" y="${ty}" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="9px" font-weight="600" fill="#8f96a3" text-anchor="middle" dominant-baseline="middle">${v}</text>`;
   });
 
   // Determine sentiment color
   let labelColor = "#f1c40f";
-  if (score > 50) labelColor = "#00cc66";
-  else if (score > 15) labelColor = "#88cc44";
-  else if (score < -50) labelColor = "#cc4444";
-  else if (score < -15) labelColor = "#cc8844";
+  if (score > 50) labelColor = "#27ae60";
+  else if (score > 15) labelColor = "#2ecc71";
+  else if (score < -50) labelColor = "#e74c3c";
+  else if (score < -15) labelColor = "#e67e22";
 
   document.getElementById('gaugeWrap').innerHTML = `
     <div style="position:relative;text-align:center">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120" class="gauge-svg">
-      <path d="` + bearArc + `" stroke="#e74c3c" stroke-width="12" fill="none" stroke-linecap="round" opacity="0.8"/>
-      <path d="` + bullArc + `" stroke="#00cc66" stroke-width="12" fill="none" stroke-linecap="round" opacity="0.8"/>
-      <path d="M ` + (cx-r-2) + `,` + cy + ` A ` + (r+2) + `,` + (r+2) + ` 0 0,0 ` + (cx+r+2) + `,` + cy + `" stroke="#1f2330" stroke-width="1" fill="none"/>
-      <circle cx="` + cx + `" cy="` + cy + `" r="` + (r-8) + `" fill="#0e1118" opacity="0.5"/>
-      <line x1="` + cx + `" y1="` + cy + `" x2="` + nx + `" y2="` + ny + `" stroke="#e8eaed" stroke-width="3" stroke-linecap="round"/>
-      <circle cx="` + cx + `" cy="` + cy + `" r="5" fill="#e8eaed"/>
-    </svg>` + ticksHtml + `
-    <div class="gl" style="color:` + labelColor + `">` + getScoreLabel(score) + `</div>
-    <div class="gv">` + (score >= 0 ? '+' : '') + score + ` / 100</div>
+      ${svgPaths}
+      <path d="M ${cx - r - 2},${cy} A ${r + 2},${r + 2} 0 0,1 ${cx + r + 2},${cy}" stroke="#1f2330" stroke-width="1" fill="none"/>
+      <circle cx="${cx}" cy="${cy}" r="${r - 8}" fill="#0e1118" opacity="0.5"/>
+      ${svgTexts}
+      <line x1="${cx}" y1="${cy}" x2="${nx}" y2="${ny}" stroke="#e8eaed" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="${cx}" cy="${cy}" r="5" fill="#e8eaed"/>
+    </svg>
+    <div class="gl" style="color:${labelColor}">${getScoreLabel(score)}</div>
+    <div class="gv">${score >= 0 ? '+' : ''}${score} / 100</div>
     </div>
   `;
 
@@ -454,6 +552,133 @@ function renderAll() {
     ul.appendChild(li);
   });
   bulletsBox.appendChild(ul);
+
+  // 7. Render Price & Volatility Regime Analysis Plot (Plotly Multi-axis with Shading)
+  if (data.hmm_dates && data.hmm_dates.length > 0) {
+    document.getElementById('regimeTitle').textContent = "Price & Volatility Regime Analysis - " + currentIdx;
+    
+    // Draw HMM Vol Shading blocks as layout shapes
+    let shapes = [];
+    let stateStart = null;
+    for (let i = 0; i < data.hmm_regimes.length; i++) {
+      if (data.hmm_regimes[i] === 'high_vol') {
+        if (stateStart === null) {
+          stateStart = data.hmm_dates[i];
+        }
+      } else {
+        if (stateStart !== null) {
+          shapes.push({
+            type: 'rect',
+            xref: 'x',
+            yref: 'paper',
+            x0: stateStart,
+            x1: data.hmm_dates[i - 1],
+            y0: 0,
+            y1: 1,
+            fillcolor: 'rgba(231,76,60,0.12)',
+            line: { width: 0 }
+          });
+          stateStart = null;
+        }
+      }
+    }
+    if (stateStart !== null) {
+      shapes.push({
+        type: 'rect',
+        xref: 'x',
+        yref: 'paper',
+        x0: stateStart,
+        x1: data.hmm_dates[data.hmm_dates.length - 1],
+        y0: 0,
+        y1: 1,
+        fillcolor: 'rgba(231,76,60,0.12)',
+        line: { width: 0 }
+      });
+    }
+
+    const regimePlotData = [
+      {
+        x: data.hmm_dates,
+        y: data.hmm_prices,
+        name: currentIdx + ' Price',
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#2a6cff', width: 2 },
+        yaxis: 'y1'
+      }
+    ];
+
+    const regimeLayout = {
+      margin: { l: 50, r: 20, t: 25, b: 40 },
+      paper_bgcolor: '#131722',
+      plot_bgcolor: '#131722',
+      showlegend: false,
+      xaxis: {
+        gridcolor: '#1f2330',
+        tickfont: { color: '#8f96a3', size: 10 },
+        type: 'date'
+      },
+      yaxis: {
+        title: 'Index price',
+        titlefont: { color: '#2a6cff', size: 11 },
+        tickfont: { color: '#8f96a3', size: 10 },
+        gridcolor: '#1f2330'
+      },
+      shapes: shapes,
+      hovermode: 'x'
+    };
+
+    Plotly.react('regimeContainer', regimePlotData, regimeLayout, { displayModeBar: false, responsive: true });
+  }
+
+  // 8. Render Volatility Shading Plot (RV vs IV)
+  if (data.hmm_dates && data.hmm_dates.length > 0) {
+    const volPlotData = [
+      {
+        x: data.hmm_dates,
+        y: data.hmm_rv,
+        name: '22d Realized Vol %',
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#f1c40f', width: 1.5 }
+      },
+      {
+        x: data.hmm_dates,
+        y: data.hmm_iv,
+        name: 'ATM Implied Vol %',
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#ff7f0e', width: 1.5, dash: 'dot' }
+      }
+    ];
+
+    const volLayout = {
+      margin: { l: 40, r: 20, t: 25, b: 40 },
+      paper_bgcolor: '#131722',
+      plot_bgcolor: '#131722',
+      showlegend: true,
+      legend: {
+        orientation: 'h',
+        x: 0,
+        y: 1.15,
+        font: { color: '#8f96a3', size: 10 }
+      },
+      xaxis: {
+        gridcolor: '#1f2330',
+        tickfont: { color: '#8f96a3', size: 10 },
+        type: 'date'
+      },
+      yaxis: {
+        title: 'Annualized Vol %',
+        titlefont: { color: '#8f96a3', size: 11 },
+        tickfont: { color: '#8f96a3', size: 10 },
+        gridcolor: '#1f2330'
+      },
+      hovermode: 'x'
+    };
+
+    Plotly.react('volHeatmapContainer', volPlotData, volLayout, { displayModeBar: false, responsive: true });
+  }
 }
 
 // Helpers
@@ -477,7 +702,8 @@ function switchIndex(idx) {
 
 function setMode(mode) {
   currentMode = mode;
-  document.getElementById('btnIV').className = 'rb' + (mode === 'iv' ? ' active' : '');
+  document.getElementById('btnRawIV').className = 'rb' + (mode === 'iv' ? ' active' : '');
+  document.getElementById('btnSmoothIV').className = 'rb' + (mode === 'sv' ? ' active' : '');
   document.getElementById('btnLV').className = 'rb' + (mode === 'lv' ? ' active' : '');
   renderAll();
 }
@@ -517,9 +743,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Silence annoying routing logs
         pass
 
-print(f"\n  >>> Index Quant Hub Running at http://127.0.0.1:{PORT}  <<<\n")
-server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
-try:
-    server.serve_forever()
-except KeyboardInterrupt:
-    server.server_close()
+if __name__ == "__main__":
+    print(f"\n  >>> Index Quant Hub Running at http://127.0.0.1:{PORT}  <<<\n")
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
