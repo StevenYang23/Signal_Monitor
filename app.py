@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__) or ".")
-from vol_surface import VolSurfaceConfig, VolSurfaceStudy, build_iv_grid, dupire_local_vol
+from vol_surface import VolSurfaceConfig, VolSurfaceStudy, build_iv_grid, dupire_local_vol, fetch_spot_yfinance
 from surface_sentiment import SurfaceDeltaPCA, SurfacePCAConfig
 from volatility_regime import HMMVolatilityRegime
 
@@ -18,20 +18,21 @@ PORT = int(os.environ.get("PORT", 8050))
 # ----------------- Quant Pipeline Handler -----------------
 class QuantEngine:
     def __init__(self):
-        self.cache: dict[str, dict] = {}
-        self.last_run: float = 0.0
+        # Memory caching disabled to ensure fresh reads / live updates on every refresh
+        pass
 
     def run_pipeline(self) -> dict:
-        now = time.time()
-        # Cache for 2 hours to keep the UI snappy and avoid hitting RateLimits / network lags repeatedly
-        if "data" in self.cache and (now - self.last_run) < 7200:
-            return self.cache["data"]
-
-        # Run pipeline over SPX, NDX, DJI
-        ticker_map = {
+        # Run pipeline over SPX, NDX (IXIC tab), DJI
+        # NDX/DJI IV from liquid ETF options; index spot kept for display
+        option_map = {
             "SPX": "US..SPX",
-            "IXIC": "US..IXIC", 
-            "DJI": "US..DJI"
+            "IXIC": "US.QQQ",
+            "DJI": "US.DIA",
+        }
+        index_spot_map = {
+            "SPX": "^SPX",
+            "IXIC": "^NDX",
+            "DJI": "^DJI",
         }
         hmm_map = {
             "SPX": "SPX",
@@ -40,22 +41,26 @@ class QuantEngine:
         }
 
         indices_data = {}
-        for short_name, vol_ticker in ticker_map.items():
+        for short_name, option_ticker in option_map.items():
             try:
                 # 1. Volatility Surfaces
-                cfg = VolSurfaceConfig(underlying=vol_ticker, max_dte=60, lookback_days=15)
+                cfg = VolSurfaceConfig(underlying=option_ticker, max_dte=60, lookback_days=15)
                 study = VolSurfaceStudy(cfg)
-                # Fallback to rich synthetics if local caches empty
-                study.load_history(use_demo_if_empty=True)
+                # Load real data directly from disk; demo synthetic generations are strictly disabled
+                study.load_history(use_demo_if_empty=False)
                 
                 dates = sorted(study.surfaces.keys())
                 today_d = dates[-1]
                 df_today = study.surfaces[today_d]
-                spot = float(df_today["spot"].iloc[0])
+                option_spot = float(df_today["spot"].iloc[0])
+                try:
+                    spot, _ = fetch_spot_yfinance(index_spot_map[short_name])
+                except Exception:
+                    spot = option_spot
 
                 # Interpolate 3D Moneyness grids
                 g_dte, g_ks, iv_g = build_iv_grid(df_today, max_dte=cfg.max_dte)
-                lv = dupire_local_vol(spot, g_dte, g_ks, iv_g, r=cfg.risk_free_rate)
+                lv = dupire_local_vol(option_spot, g_dte, g_ks, iv_g, r=cfg.risk_free_rate)
 
                 x_ks = [float(val) for val in g_ks[0, :]]
                 y_dte = [float(val) for val in g_dte[:, 0]]
@@ -165,12 +170,25 @@ class QuantEngine:
                     feats = hmm_model.features
                     regs = hmm_model.regimes
                     if feats is not None and regs is not None:
-                        aligned = feats.join(regs, how="inner").dropna(subset=["SPX", "RV_22", "IV", "hmm"])
+                        aligned = feats.join(regs, how="inner").dropna(subset=["SPX", "RV_22", "VIX", "hmm"])
                         history_df = aligned.tail(44)
+                        
+                        # Fetch Open, High, Low and Volume information
+                        ohlc_df = hmm_model._download_ohlc(
+                            hmm_model.underly_ticker,
+                            start=history_df.index[0],
+                            end=history_df.index[-1]
+                        ).reindex(history_df.index)
+                        
                         hmm_history_dates = [d.strftime("%Y-%m-%d") for d in history_df.index]
                         hmm_history_prices = [float(v) for v in history_df["SPX"]]
+                        hmm_history_opens = [float(v) for v in ohlc_df["Open"].fillna(history_df["SPX"])]
+                        hmm_history_highs = [float(v) for v in ohlc_df["High"].fillna(history_df["SPX"])]
+                        hmm_history_lows = [float(v) for v in ohlc_df["Low"].fillna(history_df["SPX"])]
+                        hmm_history_volumes = [float(v) for v in ohlc_df.get("Volume", pd.Series(0, index=ohlc_df.index)).fillna(0)]
+                        
                         hmm_history_rv = [float(v) for v in history_df["RV_22"]]
-                        hmm_history_iv = [float(v) for v in history_df["IV"]]
+                        hmm_history_iv = [float(v) for v in history_df["VIX"]]
                         hmm_history_regimes = [str(v) for v in history_df["hmm"]]
 
                 indices_data[short_name] = {
@@ -201,6 +219,10 @@ class QuantEngine:
                     "hmm_move_table": move_rows,
                     "hmm_dates": hmm_history_dates,
                     "hmm_prices": hmm_history_prices,
+                    "hmm_opens": hmm_history_opens,
+                    "hmm_highs": hmm_history_highs,
+                    "hmm_lows": hmm_history_lows,
+                    "hmm_volumes": hmm_history_volumes,
                     "hmm_rv": hmm_history_rv,
                     "hmm_iv": hmm_history_iv,
                     "hmm_regimes": hmm_history_regimes
@@ -213,8 +235,6 @@ class QuantEngine:
                     "error": str(e)
                 }
 
-        self.cache["data"] = indices_data
-        self.last_run = now
         return indices_data
 
 
@@ -240,9 +260,9 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 .main-layout{display:flex;flex:1;overflow:hidden;padding:16px;gap:16px;height:calc(100vh - 54px)}
 .panel{background:#131722;border-radius:8px;border:1px solid #1f2330;overflow:hidden;display:flex;flex-direction:column}
 .ptitle{font-size:11px;font-weight:600;padding:10px 16px;border-bottom:1px solid #1f2330;color:#8f96a3;text-transform:uppercase;letter-spacing:.8px}
-.surface-panel{flex:1.4;display:flex;flex-direction:column}
-.left-col{flex:1.2;display:flex;flex-direction:column;gap:16px;height:100%}
-.price-regime-panel{flex:1.0;display:flex;flex-direction:column}
+.surface-panel{flex:1.4;display:flex;flex-direction:column;min-height: 400px;}
+.left-col{flex:1.2;display:flex;flex-direction:column;gap:16px;height:100%;overflow-y:auto;padding-right:4px;}
+.price-regime-panel{flex:1.0;display:flex;flex-direction:column;min-height: 380px;}
 .sidebar{flex:0.8;display:flex;flex-direction:column;gap:16px;overflow-y:auto;padding-right:4px}
 .controls{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid #1f2330;align-items:center}
 .controls label{font-size:11px;color:#8f96a3;font-weight:500}
@@ -298,6 +318,12 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
       </div>
       <div id="surfaceContainer" style="flex:1"></div>
     </div>
+
+    <!-- Horizontal Sentiment Thermometer Bar placed directly under the Surface -->
+    <div class="panel" style="flex: 0 0 auto; padding: 12px 16px;">
+      <div class="ptitle" style="padding: 0 0 10px 0; border-bottom: none;">Quant Sentiment Compass (Horizontal Thermometer)</div>
+      <div id="horizontalCompassContainer" style="position: relative; min-height: 52px; margin-top: 4px;"></div>
+    </div>
     
     <div class="panel price-regime-panel">
       <div class="ptitle" id="regimeTitle">Price & Volatility Regime Analysis - SPX</div>
@@ -308,9 +334,8 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
   <div class="sidebar">
     <div class="panel" style="flex-shrink: 0;">
       <div class="ptitle">Quant Regime & Sentiment Compass</div>
-      <div class="dashboard-grid">
-        <div class="gauge-wrap" id="gaugeWrap"></div>
-        <div style="display:flex;flex-direction:column;gap:10px">
+      <div class="dashboard-grid" style="grid-template-columns: 1fr; gap: 10px; padding: 16px;">
+        <div style="display:flex; flex-direction:column; gap:10px">
           <div class="hmm-indicator" id="hmmModeCard">
             <div style="font-size:9px;text-transform:uppercase;font-weight:600;opacity:0.8">HMM Trading Signal</div>
             <div style="font-size:16px;font-weight:700;margin:2px 0" id="hmmSignalVal">--</div>
@@ -348,6 +373,7 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
       </div>
     </div>
 
+    <!-- Vol Shading Analysis RV vs IV (Third subplot, positioned below structure metrics / move targets) -->
     <div class="panel price-regime-panel" style="flex: 1; min-height: 200px;">
       <div class="ptitle">Volatility Historical Shading (RV vs IV)</div>
       <div id="volHeatmapContainer" style="flex: 1; min-height: 200px;"></div>
@@ -435,61 +461,32 @@ function renderAll() {
   };
   Plotly.react('surfaceContainer', plotlyData, layout, {displayModeBar: false, responsive: true});
 
-  // 2. Speedometer Gauge
+  // 2. Speedometer Gauge (Disabled & replaced by horizontal thermometer under Surface)
   const score = data.score;
-  const angle = (score + 100) / 200 * 180;
-  const rad = angle * Math.PI / 180;
-  const r = 70, cx = 100, cy = 90;
-  const nx = cx - r * Math.cos(rad), ny = cy - r * Math.sin(rad);
 
-  // Define 5-tier colored gauge segments (Red, Orange, Yellow, Light Green, Green)
-  const segments = [
-    { start: -100, end: -50, color: "#e74c3c" },  // Far Left
-    { start: -50,  end: -15, color: "#e67e22" },  // Mid Left
-    { start: -15,  end: 15,  color: "#f1c40f" },  // Center Neutral
-    { start: 15,   end: 50,  color: "#2ecc71" },  // Mid Right
-    { start: 50,   end: 100, color: "#27ae60" }   // Far Right
-  ];
+  // 7. Render Horizontal Sentiment Thermometer Bar under the 3D Surface
+  const compassPct = ((score + 100) / 200) * 100;
+  let scoreLabelColor = "#f1c40f";
+  if (score > 50) scoreLabelColor = "#27ae60";
+  else if (score > 15) scoreLabelColor = "#2ecc71";
+  else if (score < -50) scoreLabelColor = "#e74c3c";
+  else if (score < -15) scoreLabelColor = "#e67e22";
 
-  let svgPaths = "";
-  segments.forEach(seg => {
-    const startRad = (seg.start + 100) / 200 * Math.PI;
-    const endRad = (seg.end + 100) / 200 * Math.PI;
-    const sx = cx - r * Math.cos(startRad);
-    const sy = cy - r * Math.sin(startRad);
-    const ex = cx - r * Math.cos(endRad);
-    const ey = cy - r * Math.sin(endRad);
-    svgPaths += `<path d="M ${sx},${sy} A ${r},${r} 0 0,1 ${ex},${ey}" stroke="${seg.color}" stroke-width="12" fill="none" stroke-linecap="round" opacity="0.8"/>`;
-  });
-
-  // Calculate coordinates for Tick Labels using SVG <text> elements
-  let svgTexts = "";
-  [-100, -50, 0, 50, 100].forEach(v => {
-    const a = (v + 100) / 200 * Math.PI;
-    const tx = cx - (r + 14) * Math.cos(a);
-    const ty = cy - (r + 14) * Math.sin(a);
-    svgTexts += `<text x="${tx}" y="${ty}" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="9px" font-weight="600" fill="#8f96a3" text-anchor="middle" dominant-baseline="middle">${v}</text>`;
-  });
-
-  // Determine sentiment color
-  let labelColor = "#f1c40f";
-  if (score > 50) labelColor = "#27ae60";
-  else if (score > 15) labelColor = "#2ecc71";
-  else if (score < -50) labelColor = "#e74c3c";
-  else if (score < -15) labelColor = "#e67e22";
-
-  document.getElementById('gaugeWrap').innerHTML = `
-    <div style="position:relative;text-align:center">
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120" class="gauge-svg">
-      ${svgPaths}
-      <path d="M ${cx - r - 2},${cy} A ${r + 2},${r + 2} 0 0,1 ${cx + r + 2},${cy}" stroke="#1f2330" stroke-width="1" fill="none"/>
-      <circle cx="${cx}" cy="${cy}" r="${r - 8}" fill="#0e1118" opacity="0.5"/>
-      ${svgTexts}
-      <line x1="${cx}" y1="${cy}" x2="${nx}" y2="${ny}" stroke="#e8eaed" stroke-width="3" stroke-linecap="round"/>
-      <circle cx="${cx}" cy="${cy}" r="5" fill="#e8eaed"/>
-    </svg>
-    <div class="gl" style="color:${labelColor}">${getScoreLabel(score)}</div>
-    <div class="gv">${score >= 0 ? '+' : ''}${score} / 100</div>
+  document.getElementById('horizontalCompassContainer').innerHTML = `
+    <div style="position:relative; width:100%; padding-top:20px;">
+      <div class="sentiment-thermometer-label-container" style="display: flex; justify-content: space-between; font-size: 10px; color: #8f96a3; margin-bottom: 6px; font-weight: 500;">
+        <span>Extremely Bearish (-100)</span>
+        <span>Neutral (0)</span>
+        <span>Extremely Bullish (100)</span>
+      </div>
+      <div class="sentiment-bar-track" style="position: relative; height: 16px; background: linear-gradient(90deg, #e74c3c 0%, #e67e22 25%, #f1c40f 50%, #2ecc71 75%, #27ae60 100%); border-radius: 8px; overflow: visible;">
+        <!-- Pointer marker -->
+        <div id="sentimentPointer" style="position: absolute; top: -3px; left: ${compassPct}%; width: 6px; height: 22px; background: #ffffff; border-radius: 3px; box-shadow: 0 0 10px rgba(255,255,255,0.8), 0 0 4px rgba(0,0,0,0.5); transform: translateX(-50%); transition: left 0.3s ease;"></div>
+        <!-- Tooltip box sliding with pointer -->
+        <div id="sentimentValueMarker" style="position: absolute; top: -34px; left: ${compassPct}%; background: #2a6cff; color: #ffffff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; transform: translateX(-50%); transition: left 0.3s ease; white-space: nowrap; box-shadow: 0 2px 6px rgba(0,0,0,0.3);">
+          Score: <span id="sentimentValueSpan">${score >= 0 ? '+' : ''}${score}</span>/100 (<span style="color: ${scoreLabelColor}">${getScoreLabel(score)}</span>)
+        </div>
+      </div>
     </div>
   `;
 
@@ -599,30 +596,53 @@ function renderAll() {
     const regimePlotData = [
       {
         x: data.hmm_dates,
-        y: data.hmm_prices,
+        open: data.hmm_opens,
+        high: data.hmm_highs,
+        low: data.hmm_lows,
+        close: data.hmm_prices,
         name: currentIdx + ' Price',
-        type: 'scatter',
-        mode: 'lines',
-        line: { color: '#2a6cff', width: 2 },
-        yaxis: 'y1'
+        type: 'candlestick',
+        xaxis: 'x',
+        yaxis: 'y1',
+        increasing: { line: { color: '#2ecc71' } },
+        decreasing: { line: { color: '#e74c3c' } }
+      },
+      {
+        x: data.hmm_dates,
+        y: data.hmm_volumes,
+        name: 'Volume',
+        type: 'bar',
+        xaxis: 'x',
+        yaxis: 'y2',
+        marker: { color: 'rgba(42, 108, 255, 0.45)' }
       }
     ];
 
     const regimeLayout = {
-      margin: { l: 50, r: 20, t: 25, b: 40 },
+      margin: { l: 50, r: 50, t: 25, b: 40 },
       paper_bgcolor: '#131722',
       plot_bgcolor: '#131722',
       showlegend: false,
       xaxis: {
         gridcolor: '#1f2330',
         tickfont: { color: '#8f96a3', size: 10 },
-        type: 'date'
+        type: 'date',
+        rangeslider: { visible: false }
       },
       yaxis: {
         title: 'Index price',
         titlefont: { color: '#2a6cff', size: 11 },
         tickfont: { color: '#8f96a3', size: 10 },
-        gridcolor: '#1f2330'
+        gridcolor: '#1f2330',
+        domain: [0.3, 1]
+      },
+      yaxis2: {
+        title: 'Volume',
+        titlefont: { color: '#8f96a3', size: 11 },
+        tickfont: { color: '#8f96a3', size: 9 },
+        gridcolor: '#1f2330',
+        domain: [0, 0.25],
+        anchor: 'x'
       },
       shapes: shapes,
       hovermode: 'x'

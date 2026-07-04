@@ -39,6 +39,8 @@ SPOT_YF_DEFAULT: dict[str, str] = {
     "US..SPX": "^SPX",
     "US..IXIC": "^IXIC",
     "US..DJI": "^DJI",
+    "US.QQQ": "QQQ",
+    "US.DIA": "DIA",
 }
 # Back-compat alias
 SPOT_YF_FALLBACK = SPOT_YF_DEFAULT

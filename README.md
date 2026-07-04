@@ -1,3 +1,13 @@
+## Live Dashboard Demo / 实时看板预览
+
+![Index Quant Signal Hub — SPX Dashboard](demo/signal_page.png)
+
+*Index Quant Signal Hub — integrated 3D volatility surface, sentiment compass, HMM regime signals, VRP/term-structure metrics, and 1-sigma move targets for SPX, IXIC, and DJI.*
+
+*Index Quant Signal Hub — 集成 3D 波动率曲面、情绪罗盘、HMM 机制信号、VRP/期限结构指标及 1-sigma 波动目标，覆盖 SPX、IXIC、DJI 三大指数。*
+
+---
+
 # Signal Monitor — Equity Volatility Regime & Option Sentiment Dashboard
 # Signal Monitor — 美股波动率机制与期权情绪监测看板
 
