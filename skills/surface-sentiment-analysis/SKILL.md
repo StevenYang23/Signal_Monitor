@@ -53,7 +53,8 @@ print(report)
 
 ### Secondary inputs (for deeper analysis)
 
-- **Local vol heatmap**: `study.plot_local_vol_heatmap()` shows where local vol spikes occur in (DTE, delta) space.
+- **Compass Gauge speedometer**: A dual-panel representation displaying aggregate sentiment as a Fear/Greed-style speedometer index (ranging from Extremely Bearish to Extremely Bullish) alongside structured market summary bullets.
+- **Local vol heatmap / Moneyness surface**: `study.plot_local_vol_heatmap()` or gridding over K/S (moneyness) and DTE coordinates to show where local vol spikes occur.
 - **PCA loading heatmaps**: `pca.plot_loadings(result)` shows what each PC looks like as a surface.
 - **Term structure**: `study.plot_term_structure()` shows ATM IV across expiries over time.
 

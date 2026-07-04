@@ -69,7 +69,7 @@ class VolSurfaceConfig:
     anchor_dtes: tuple[int, ...] = (7, 30, 60)
     anchor_delta: float = 0.25
     anchor_hv_period: int = 22
-    cache_dir: Path = field(default_factory=lambda: Path("research/data/vol_surface"))
+    cache_dir: Path = field(default_factory=lambda: Path(__file__).parent.resolve() / "research" / "data" / "vol_surface")
     use_deepseek: bool = False
 
     def cache_path(self, asof: date | str) -> Path:
@@ -1900,9 +1900,9 @@ class VolSurfaceStudy:
     def load_history(self, use_demo_if_empty: bool = False) -> None:
         self._invalidate_plot_cache()
         self.surfaces = load_surface_history(self.cfg, self.cfg.lookback_days)
-        if not self.surfaces and use_demo_if_empty:
+        if (not self.surfaces or len(self.surfaces) < 6) and use_demo_if_empty:
             warnings.warn(
-                "No cached surfaces �?loading demo SPX surfaces.",
+                "No cached surfaces or too few sessions - loading demo SPX surfaces.",
                 stacklevel=2,
             )
             self.surfaces = generate_demo_surfaces(self.cfg, n_days=self.cfg.lookback_days + 1)

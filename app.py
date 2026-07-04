@@ -7,7 +7,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__) or ".")
 from vol_surface import build_iv_grid_delta, dupire_local_vol_delta
 
-DATA_DIR = Path("research/data/vol_surface/US__SPX")
+DATA_DIR = Path(__file__).parent.resolve() / "research" / "data" / "vol_surface" / "US__SPX"
 files = sorted(glob.glob(str(DATA_DIR / "*.parquet")))
 ALL_SURFACES = {}
 for f in files:

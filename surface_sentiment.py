@@ -166,14 +166,14 @@ class SurfaceDeltaPCA:
                     baseline_mean = np.nanmean(X[start:end], axis=0)
                     D[i] = X[i] - baseline_mean
  
-            # Fallback: if rolling produced no valid deltas (too few sessions),
-            # use day-over-day changes instead so we don't crash with an empty array.
-            has_any_delta = (np.abs(D).sum(axis=1) > 1e-10).any()
-            if not has_any_delta:
+            # Fallback: if rolling produced too few valid deltas to fit PCA components,
+            # use day-over-day changes instead so we don't crash with standard scaling or empty arrays.
+            valid_count = (np.abs(D).sum(axis=1) > 1e-10).sum()
+            if valid_count < min(cfg.n_components, len(X) - 1) or valid_count < 2:
                 logger.warning(
-                    "Not enough sessions (%d) for rolling baseline (need > smooth_days=%d + 1). "
+                    "Not enough valid rolling delta-surfaces (%d) to fit PCA components (%d) or StandardScale safely. "
                     "Falling back to 'prev' (day-over-day change).",
-                    len(X), cfg.smooth_days,
+                    valid_count, cfg.n_components,
                 )
                 D = np.zeros_like(X)
                 D[1:] = X[1:] - X[:-1]
