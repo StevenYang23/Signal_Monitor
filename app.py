@@ -1,194 +1,495 @@
-import os, sys, glob, warnings, json, http.server, urllib.parse, traceback
+import os, sys, glob, warnings, json, http.server, urllib.parse, traceback, time
 from pathlib import Path
+from datetime import date
 warnings.filterwarnings("ignore")
+
+# Configure temporary configurations for matplotlib in headless deployment environments
 os.environ["MPLCONFIGDIR"] = os.path.join(os.path.dirname(__file__) or ".", ".matplotlib_temp")
 import numpy as np
 import pandas as pd
+
 sys.path.insert(0, os.path.dirname(__file__) or ".")
-from vol_surface import build_iv_grid_delta, dupire_local_vol_delta
+from vol_surface import VolSurfaceConfig, VolSurfaceStudy, build_iv_grid, dupire_local_vol
+from surface_sentiment import SurfaceDeltaPCA, SurfacePCAConfig
+from volatility_regime import HMMVolatilityRegime
 
-DATA_DIR = Path(__file__).parent.resolve() / "research" / "data" / "vol_surface" / "US__SPX"
-files = sorted(glob.glob(str(DATA_DIR / "*.parquet")))
-ALL_SURFACES = {}
-for f in files:
-    ALL_SURFACES[pd.Timestamp(Path(f).stem).date()] = pd.read_parquet(f)
-dates = sorted(ALL_SURFACES.keys())
-TODAY, DF_TODAY = dates[-1], ALL_SURFACES[dates[-1]]
-SPOT = float(DF_TODAY["spot"].iloc[0])
-dg = np.linspace(-0.5, 0.5, 31)
-eg = np.array([7, 10, 14, 21, 30, 45, 60])
-GD, GDL, IV_GRID = build_iv_grid_delta(DF_TODAY, delta_grid=dg, dte_grid=eg, max_dte=60)
-LV_GRID = dupire_local_vol_delta(SPOT, GD, GDL, IV_GRID, r=0.045)
+PORT = int(os.environ.get("PORT", 8050))
 
-# compact 1d axes
-dte_1d = [float(x) for x in GD[:,0]]
-del_1d = [float(x) for x in GDL[0,:]]
-iv_data = [[float(v) for v in row] for row in IV_GRID]
-lv_data = [[float(v) for v in row] for row in LV_GRID]
+# ----------------- Quant Pipeline Handler -----------------
+class QuantEngine:
+    def __init__(self):
+        self.cache: dict[str, dict] = {}
+        self.last_run: float = 0.0
 
-# sentiment
-df30 = DF_TODAY[DF_TODAY["dte"].between(28, 32)].copy()
-if len(df30) == 0: df30 = DF_TODAY.nsmallest(50, "dte")
-df30["ad"] = df30["delta"].abs(); atm = df30.loc[df30["ad"].idxmin()]; aiv = float(atm["iv"])
-pw = df30[df30["delta"].between(-0.35, -0.20)]
-psk_v = float(pw["iv"].mean()) if len(pw) > 0 else aiv*1.1; psk = (psk_v/aiv-1)*100
-cw = df30[df30["delta"].between(0.20, 0.35)]
-csk_v = float(cw["iv"].mean()) if len(cw) > 0 else aiv*1.05; csk = (csk_v/aiv-1)*100
-s7 = DF_TODAY[DF_TODAY["dte"].between(4,10)].copy(); s7["ad"]=s7["delta"].abs()
-r7 = s7.loc[s7["ad"].idxmin()] if len(s7)>0 else atm
-s60 = DF_TODAY[DF_TODAY["dte"].between(50,61)].copy(); s60["ad"]=s60["delta"].abs()
-r60 = s60.loc[s60["ad"].idxmin()] if len(s60)>0 else atm; tsl = float(r60["iv"])-float(r7["iv"])
-am = [s[np.isfinite(s["iv"])]["iv"].median() for _,s in ALL_SURFACES.items() if len(s[np.isfinite(s["iv"])])>0]
-ivs = pd.Series(am, index=sorted(ALL_SURFACES.keys()))
-rnk = (ivs<aiv).sum()/max(len(ivs)-1,1) if len(ivs)>1 else 0.5; ivc = (1-rnk)*100-50
-ps = np.clip(-psk*25/max(abs(psk)+0.5,5), -25, 25)
-cs = np.clip(csk*25/max(abs(csk)+0.5,3), -15, 25)
-ts = np.clip(tsl*25/max(abs(tsl)+0.5,3), -25, 25)
-cmp = float(np.clip(ps+cs+ivc+ts, -100, 100))
-if cmp > 50: lbl, col = "Bullish", "#00cc66"
-elif cmp > 15: lbl, col = "Slightly Bullish", "#88cc44"
-elif cmp > -15: lbl, col = "Neutral", "#cccc44"
-elif cmp > -50: lbl, col = "Slightly Bearish", "#cc8844"
-else: lbl, col = "Bearish", "#cc4444"
+    def run_pipeline(self) -> dict:
+        now = time.time()
+        # Cache for 2 hours to keep the UI snappy and avoid hitting RateLimits / network lags repeatedly
+        if "data" in self.cache and (now - self.last_run) < 7200:
+            return self.cache["data"]
 
-# summary
-ivf = IV_GRID.flatten(); hi, lo = float(np.nanmax(ivf)), float(np.nanmin(ivf))
-hidx = int(np.nanargmax(ivf)); hd, hdel = int(GD.flatten()[hidx]), float(GDL.flatten()[hidx])
-lvf = LV_GRID.flatten(); lvm = float(np.nanmean(lvf)) if np.isfinite(lvf).any() else 0; lmin = float(np.nanmin(lvf))
-psk_r, tsl_r, aiv_r = round(psk,1), round(tsl,1), round(aiv,1)
-psk_str = f"Put/call skew balanced ({psk_r:+.1f}%) — no extreme directional bias" if -1<=psk_r<=3 else (f"Put skew elevated ({psk_r:+.1f}%) — tail hedging demand elevated" if psk_r>3 else f"Call skew dominant ({psk_r:+.1f}%) — put premium subdued")
-tsl_str = f"Term structure flat ({tsl_r:+.1f}pt) — no clear tenor dislocation" if -2<=tsl_r<=2 else (f"Term structure inverted ({tsl_r:+.1f}pt) — near-term stress" if tsl_r<-2 else f"Term structure steep ({tsl_r:+.1f}pt) — uncertainty in longer tenor")
-slist = [f"SPX @ {SPOT:,.0f} | ATM IV: {aiv_r}%", psk_str, tsl_str, f"Surface sentiment: {lbl} ({round(cmp)}/100)", f"IV range: {lo:.1f}–{hi:.1f}% (peak @ DTE={hd}, delta={hdel:+.2f})", f"Local vol avg: {lvm:.1f}% (min: {lmin:.1f}%)", f"Data as of {TODAY}"]
+        # Run pipeline over SPX, NDX, DJI
+        ticker_map = {
+            "SPX": "US..SPX",
+            "IXIC": "US..IXIC", 
+            "DJI": "US..DJI"
+        }
+        hmm_map = {
+            "SPX": "SPX",
+            "IXIC": "NSDQ",
+            "DJI": "DJI"
+        }
 
-data = json.dumps(dict(t=str(TODAY), sp=SPOT, aiv=aiv_r, cmp=round(cmp), l=lbl, c=col, psk=psk_r, csk=round(csk,1), tsl=tsl_r, x=dte_1d, y=del_1d, z=iv_data, w=lv_data, hi=round(hi,1), lo=round(lo,1), ph=hd, pd=round(hdel,2), lm=round(lvm,1), ln=round(lmin,1), s=slist), separators=(",", ":"))
+        indices_data = {}
+        for short_name, vol_ticker in ticker_map.items():
+            try:
+                # 1. Volatility Surfaces
+                cfg = VolSurfaceConfig(underlying=vol_ticker, max_dte=60, lookback_days=15)
+                study = VolSurfaceStudy(cfg)
+                # Fallback to rich synthetics if local caches empty
+                study.load_history(use_demo_if_empty=True)
+                
+                dates = sorted(study.surfaces.keys())
+                today_d = dates[-1]
+                df_today = study.surfaces[today_d]
+                spot = float(df_today["spot"].iloc[0])
 
-HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signal Monitor</title>
+                # Interpolate 3D Moneyness grids
+                g_dte, g_ks, iv_g = build_iv_grid(df_today, max_dte=cfg.max_dte)
+                lv = dupire_local_vol(spot, g_dte, g_ks, iv_g, r=cfg.risk_free_rate)
+
+                x_ks = [float(val) for val in g_ks[0, :]]
+                y_dte = [float(val) for val in g_dte[:, 0]]
+                iv_data = [[float(v) for v in row] for row in iv_g]
+                lv_data = [[float(v) for v in row] for row in lv]
+
+                # Run PCA Decomposition
+                result = study.analyze()
+                today_f = result["today"]
+                pca = SurfaceDeltaPCA(SurfacePCAConfig(n_components=4, baseline_window=21))
+                pca_result = pca.fit(surfaces=study.surfaces)
+                evr = pca_result["explained_variance_ratio"]
+                hist_scores = pca_result["score_history"]
+                today_scores = hist_scores[-1].tolist()
+                sentiment = pca.sentiment_from_scores(hist_scores[-1], hist_scores)
+
+                vix = float(result.get("vix_context", {}).get("vix", 15.0))
+                aiv = float(today_f.get("atm_iv_30d", np.nan))
+                psk = float(today_f.get("skew_25d", np.nan))
+                tsl = float(today_f.get("term_slope", np.nan))
+                bfly = float(today_f.get("butterfly_25d", np.nan))
+
+                if result["changes"] is not None and not result["changes"].empty:
+                    chg = result["changes"]
+                    def d5(name):
+                        row = chg.loc[chg["feature"]==name]
+                        return float(row["delta_5d"].iloc[0]) if not row.empty and np.isfinite(row["delta_5d"].iloc[0]) else 0.0
+                    d_skew = d5("skew_25d")
+                    d_bfly = d5("butterfly_25d")
+                else:
+                    d_skew = 0.0
+                    d_bfly = 0.0
+
+                vrp_val = result.get("vix_context", {}).get("vrp", vix - aiv)
+                anchor_ctx = result.get("anchor_context", {})
+                anchor_changes = anchor_ctx.get("changes", {})
+                skew_proxy_chg = anchor_changes.get("skew_proxy", 0.0)
+
+                # Compute consolidated Compass Metric score (-100 to 100)
+                ps_score = np.clip(-psk * 4.0, -35, 35)
+                ts_score = np.clip(tsl * 5.0, -25, 25)
+                vix_score = np.clip((20.0 - vix) * 2.0, -20, 20)
+                vrp_score = np.clip((6.0 - vrp_val) * 2.5, -15, 15)
+                anchor_score = np.clip(-skew_proxy_chg * 5.0, -10, 10)
+                sentiment_score = float(np.clip(ps_score + ts_score + vix_score + vrp_score + anchor_score, -100, 100))
+
+                # 2. HMM Volatility Regime 
+                hmm_ticker_name = hmm_map[short_name]
+                hmm_model = HMMVolatilityRegime.from_market(hmm_ticker_name, signal_mode=True)
+                hmm_model.display(display_period=44)
+                hmm_sig = hmm_model.today_signal
+
+                hmm_regime_str = "unknown"
+                hmm_prob_today = 50.0
+                hmm_prob_tmr = 50.0
+                hmm_signal_bool = False
+                move_rows = []
+
+                if hmm_sig is not None:
+                    hmm_regime_str = str(hmm_sig.get("hmm", "unknown"))
+                    hmm_prob_today = round(float(hmm_sig.get("prob_low_vol", 0.5)) * 100, 1)
+                    hmm_prob_tmr = round(float(hmm_sig.get("prob_low_vol_tmr", 0.5)) * 100, 1)
+                    hmm_signal_bool = bool(hmm_sig.get("trade_signal", False))
+
+                    # Extract Move Summary Boundaries Table for constructing Iron Condors
+                    move_table = hmm_model.format_movement_table()
+                    for idx in move_table.index:
+                        move_rows.append({
+                            "horizon": str(idx),
+                            "implied": str(move_table.loc[idx, "Implied"]),
+                            "historical": str(move_table.loc[idx, "Historical"]),
+                            "spot_implied": str(move_table.loc[idx, "Spot ± implied"])
+                        })
+
+                indices_data[short_name] = {
+                    "exists": True,
+                    "date": str(today_d),
+                    "spot": spot,
+                    "aiv": aiv,
+                    "vix": vix,
+                    "psk": psk,
+                    "d_skew": d_skew,
+                    "tsl": tsl,
+                    "bfly": bfly,
+                    "d_bfly": d_bfly,
+                    "vrp": vrp_val,
+                    "pc1": today_scores[0],
+                    "pc2": today_scores[1],
+                    "joint_signal": sentiment["joint_flags"][0].upper().replace("_", " ") if sentiment["joint_flags"] else "NEUTRAL",
+                    "score": round(sentiment_score, 1),
+                    "surface_x": x_ks,
+                    "surface_y": y_dte,
+                    "surface_z": iv_data,
+                    "surface_w": lv_data,
+                    "hmm_regime": hmm_regime_str,
+                    "hmm_prob_today": hmm_prob_today,
+                    "hmm_prob_tmr": hmm_prob_tmr,
+                    "hmm_signal": hmm_signal_bool,
+                    "hmm_move_table": move_rows
+                }
+            except Exception as e:
+                print(f"Error processing index {short_name}: {e}")
+                traceback.print_exc()
+                indices_data[short_name] = {
+                    "exists": False,
+                    "error": str(e)
+                }
+
+        self.cache["data"] = indices_data
+        self.last_run = now
+        return indices_data
+
+
+engine = QuantEngine()
+
+# ----------------- Dashboard HTML / JS -----------------
+HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Index Quant Signal Hub</title>
 <script src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0f1117;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow:hidden}
-.header{padding:18px 24px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;gap:12px}
-.header h1{font-size:20px;font-weight:600;color:#e8eaed;letter-spacing:.3px}
-.badge{background:#1e2028;border-radius:6px;padding:4px 12px;font-size:13px;color:#9aa0a8}
-.main{display:flex;gap:16px;padding:16px;height:calc(100vh - 62px)}
-.panel{background:#161820;border-radius:10px;border:1px solid #252830;overflow:hidden;display:flex;flex-direction:column}
-.ptitle{font-size:13px;font-weight:600;padding:12px 16px;border-bottom:1px solid #252830;color:#b0b4bc;text-transform:uppercase;letter-spacing:.5px}
-.surface-panel{flex:1}
-.sidebar{width:360px;display:flex;flex-direction:column;gap:16px}
-.controls{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid #252830;align-items:center}
-.controls label{font-size:12px;color:#9aa0a8}
-.rg{display:flex;gap:2px;background:#1a1d26;border-radius:6px;padding:2px}
-.rb{padding:5px 14px;border-radius:5px;font-size:12px;cursor:pointer;border:none;background:transparent;color:#9aa0a8;transition:all .15s;font-family:inherit}
+body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+.header{padding:14px 24px;border-bottom:1px solid #1f2330;display:flex;align-items:center;background:#131722;gap:12px;z-index:10}
+.header h1{font-size:18px;font-weight:600;color:#e8eaed;letter-spacing:.3px}
+.header-tabs{display:flex;background:#1a1f2c;border-radius:6px;padding:2px;margin-left:24px}
+.tab-btn{background:transparent;border:none;color:#8f96a3;padding:6px 16px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;transition:all .15s}
+.tab-btn.active{background:#2a6cff;color:#fff}
+.badge{background:#1c2030;border-radius:6px;padding:4px 12px;font-size:13px;color:#9aa0a8;font-weight:500}
+.main-layout{display:flex;flex:1;overflow:hidden;padding:16px;gap:16px;height:calc(100vh - 54px)}
+.panel{background:#131722;border-radius:8px;border:1px solid #1f2330;overflow:hidden;display:flex;flex-direction:column}
+.ptitle{font-size:11px;font-weight:600;padding:10px 16px;border-bottom:1px solid #1f2330;color:#8f96a3;text-transform:uppercase;letter-spacing:.8px}
+.surface-panel{flex:1.2;display:flex;flex-direction:column}
+.sidebar{flex:0.8;display:flex;flex-direction:column;gap:16px;overflow-y:auto;padding-right:4px}
+.controls{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid #1f2330;align-items:center}
+.controls label{font-size:11px;color:#8f96a3;font-weight:500}
+.rg{display:flex;gap:2px;background:#1a1f2c;border-radius:6px;padding:2px}
+.rb{padding:4px 12px;border-radius:4px;font-size:11px;cursor:pointer;border:none;background:transparent;color:#8f96a3;font-weight:600;transition:all .15s}
 .rb.active{background:#2a6cff;color:#fff}
-.rb:hover:not(.active){color:#d0d4dc}
-.gauge-wrap{position:relative;text-align:center;padding:4px 8px}
-.gauge-svg{width:100%;max-height:160px}
-.gl{text-align:center;font-size:13px;font-weight:500;padding:2px 0 4px}
-.gv{font-size:26px;font-weight:700;color:#e8eaed;margin-top:-2px}
-.summary-content{padding:12px 16px;font-size:13px;line-height:1.7;overflow-y:auto}
-.summary-content li{margin-bottom:6px;color:#b8bcc4;list-style:none}
-.summary-content li::before{content:'\u2022';color:#5a6eff;font-weight:bold;margin-right:8px}
-</style></head><body>
-<div class="header"><h1>Surface Monitor</h1><span class="badge" id="dateBadge"></span><span style="flex:1"></span><span id="spotBadge" class="badge"></span></div>
-<div class="main">
-<div class="panel surface-panel"><div class="ptitle">Vol Surface</div>
-<div class="controls"><label>Mode:</label>
-<div class="rg"><button class="rb active" id="btnIV" onclick="setMode('iv')">Implied Vol</button><button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button></div>
-</div><div id="surfaceContainer" style="flex:1"></div></div>
-<div class="sidebar">
-<div class="panel" style="min-height:220px"><div class="ptitle">Market Sentiment</div><div id="gaugeContainer" class="gauge-wrap"></div></div>
-<div class="panel" style="flex:1"><div class="ptitle">Summary</div><div id="summaryContainer" class="summary-content"></div></div>
-</div></div>
-<script>
-const D = """ + data + """;
-const ivZ = D.z, lvZ = D.w;
-let currentMode = 'iv';
+.dashboard-grid{display:grid;grid-template-columns:1fr 1.1fr;gap:12px;padding:16px;flex:1}
+.metric-card{background:#181d2e;border-radius:6px;border:1px solid #232a3f;padding:10px;display:flex;flex-direction:column;justify-content:center}
+.metric-card .label{font-size:9px;color:#8f96a3;text-transform:uppercase;font-weight:600;margin-bottom:3px}
+.metric-card .val{font-size:16px;font-weight:700;color:#ffffff}
+.gauge-wrap{position:relative;text-align:center;padding:8px;flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column}
+.gauge-svg{width:100%;max-width:240px;height:120px}
+.gv{font-size:22px;font-weight:700;margin-top:2px}
+.gl{font-size:12px;font-weight:600}
+.hmm-indicator{border-radius:6px;padding:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;transition:all .3s}
+.hmm-indicator.active{background:rgba(0,204,102,0.1);border:1.5px solid #00cc66}
+.hmm-indicator.inactive{background:rgba(231,76,60,0.1);border:1.5px solid #e74c3c}
+.summary-content{padding:12px 16px;font-size:12px;line-height:1.5;overflow-y:auto;flex:1}
+.summary-content li{margin-bottom:6px;color:#b0b6c2;list-style:none;display:flex;align-items:flex-start}
+.summary-content li::before{content:'•';color:#2a6cff;font-weight:bold;font-size:14px;margin-right:8px;line-height:1}
 
-function renderSurface(mode) {
-  const z = mode === 'iv' ? ivZ : lvZ;
-  const title = mode === 'iv' ? 'Implied Vol (%)' : 'Local Vol (%)';
-  const rng = mode === 'lv' ? [0, Math.max.apply(null, z.flat())] : undefined;
-  const data = [{
-    type: 'surface', x: D.x, y: D.y, z: z,
+/* Styled Table for Iron Condor and moves */
+.condor-table{width:100%;border-collapse:collapse;font-size:11.5px;text-align:left;color:#b0b6c2}
+.condor-table th{background:#1a1f2c;color:#8f96a3;font-weight:600;padding:8px 12px;border-bottom:1.5px solid #1f2330;text-transform:uppercase;font-size:10px;letter-spacing:.5px}
+.condor-table td{padding:8px 12px;border-bottom:1px solid #1c2030;font-family:monospace}
+.condor-table tr:hover{background:rgba(42,108,255,0.05)}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Index Quant Signal Hub</h1>
+  <div class="header-tabs">
+    <button class="tab-btn active" onclick="switchIndex('SPX')">SPX (S&P 500)</button>
+    <button class="tab-btn" onclick="switchIndex('IXIC')">IXIC (NASDAQ)</button>
+    <button class="tab-btn" onclick="switchIndex('DJI')">DJI (Dow Jones)</button>
+  </div>
+  <span style="flex:1"></span>
+  <span id="dateBadge" class="badge">--</span>
+  <span id="spotBadge" class="badge">--</span>
+</div>
+
+<div class="main-layout">
+  <div class="panel surface-panel">
+    <div class="ptitle" id="surfaceTitle">Vol Surface - SPX</div>
+    <div class="controls">
+      <label>Mode:</label>
+      <div class="rg">
+        <button class="rb active" id="btnIV" onclick="setMode('iv')">Implied Vol</button>
+        <button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button>
+      </div>
+    </div>
+    <div id="surfaceContainer" style="flex:1"></div>
+  </div>
+
+  <div class="sidebar">
+    <div class="panel" style="flex-shrink: 0;">
+      <div class="ptitle">Quant Regime & Sentiment Compass</div>
+      <div class="dashboard-grid">
+        <div class="gauge-wrap" id="gaugeWrap"></div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <div class="hmm-indicator" id="hmmModeCard">
+            <div style="font-size:9px;text-transform:uppercase;font-weight:600;opacity:0.8">HMM Trading Signal</div>
+            <div style="font-size:16px;font-weight:700;margin:2px 0" id="hmmSignalVal">--</div>
+            <div style="font-size:9px;opacity:0.9" id="hmmProbVal">--</div>
+          </div>
+          <div class="metric-card">
+            <span class="label">Volatility Risk Premium (VRP)</span>
+            <span class="val" id="vraVal">--</span>
+          </div>
+          <div class="metric-card">
+            <span class="label">Term Structure Roll Spread</span>
+            <span class="val" id="tslVal">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Short Iron Condor Selector Panel -->
+    <div class="panel" style="flex: 1; min-height: 200px;">
+      <div class="ptitle">1-Sigma Vol Move Targets (Short Iron Condor Reference)</div>
+      <div style="overflow-x: auto; flex: 1;">
+        <table class="condor-table">
+          <thead>
+            <tr>
+              <th>Horizon</th>
+              <th>Implied Move (IV)</th>
+              <th>Historical Move</th>
+              <th>Spot Range (Implied ±1σ)</th>
+            </tr>
+          </thead>
+          <tbody id="condorTableBody">
+            <tr><td colspan="4" style="text-align:center;color:#8f96a3">No data loaded</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" style="flex: 1; min-height: 200px;">
+      <div class="ptitle">Quantitative Structure Metrics</div>
+      <div class="summary-content" id="bulletsBox"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentIdx = 'SPX';
+let currentMode = 'iv';
+let dbData = {};
+
+async function fetchServerData() {
+  try {
+    const res = await fetch('/api/signals');
+    dbData = await res.json();
+    renderAll();
+  } catch (e) {
+    console.error("Error drawing Quant Hub layouts:", e);
+  }
+}
+
+function renderAll() {
+  const data = dbData[currentIdx];
+  if (!data || !data.exists) {
+    document.getElementById('surfaceContainer').innerHTML = `<div style="padding:40px;text-align:center;color:#e74c3c;font-weight:600">Quant pipeline generation failed. Double check caches or fetch live.</div>`;
+    return;
+  }
+  
+  // Date and Spot indicators
+  document.getElementById('dateBadge').textContent = 'Date: ' + data.date;
+  document.getElementById('spotBadge').textContent = currentIdx + ': ' + data.spot.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1});
+  document.getElementById('surfaceTitle').textContent = "Vol Surface - " + currentIdx;
+
+  // 1. 3D Surface
+  const z = currentMode === 'iv' ? data.surface_z : data.surface_w;
+  const title = currentMode === 'iv' ? 'Implied Vol (%)' : 'Local Vol (%)';
+  const rng = currentMode === 'lv' ? [0, Math.max(...z.flat())] : undefined;
+  
+  const plotlyData = [{
+    type: 'surface',
+    x: data.surface_x,
+    y: data.surface_y,
+    z: z,
     colorscale: 'RdYlBu_r',
-    hovertemplate: 'DTE: %{x}<br>Delta: %{y:.2f}<br>Vol: %{z:.1f}%<extra></extra>',
-    colorbar: {title: 'Vol %', titleside: 'right', x: 0.88},
+    hovertemplate: 'K/S (Moneyness): %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
+    colorbar: {title: 'Vol %', titleside: 'right', x: 0.88, len: 0.7},
     contours: {z: {show: true, usecolormap: true, highlightcolor: 'lime', project: {z: true}}},
     cmin: rng && rng[0], cmax: rng && rng[1],
   }];
+
   const layout = {
     margin: {l:0, r:0, t:0, b:0},
-    paper_bgcolor: '#161820', plot_bgcolor: '#161820',
+    paper_bgcolor: '#131722',
+    plot_bgcolor: '#131722',
     scene: {
-      xaxis: {title:'DTE', gridcolor:'#2a2d35', zerolinecolor:'#3a3d45', tickfont:{color:'#9aa0a8'}},
-      yaxis: {title:'Delta', gridcolor:'#2a2d35', zerolinecolor:'#3a3d45', tickfont:{color:'#9aa0a8'}},
-      zaxis: {title:'Vol (%)', gridcolor:'#2a2d35', zerolinecolor:'#3a3d45', tickfont:{color:'#9aa0a8'}},
-      camera: {eye: {x:-1.8, y:-1.5, z:0.7}},
-      aspectmode: 'auto',
+      xaxis: {title:'Moneyness (K/S)', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      yaxis: {title:'DTE', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      zaxis: {title:'Vol (%)', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      camera: {eye: {x:-1.5, y:-1.5, z:0.8}},
+      aspectmode: 'manual',
+      aspectratio: {x:1.0, y:1.2, z:0.6}
     },
-    hoverlabel: {bgcolor:'#1e2028', font:{size:12}},
+    hoverlabel: {bgcolor:'#1c2030', font:{size:12}},
     uirevision: 'surface',
   };
-  const cfg = {displayModeBar: false, responsive: true, scrollZoom: true};
-  Plotly.react('surfaceContainer', data, layout, cfg);
-}
+  Plotly.react('surfaceContainer', plotlyData, layout, {displayModeBar: false, responsive: true});
 
-function renderGauge() {
-  const angle = (D.cmp + 100) / 200 * 180;
+  // 2. Speedometer Gauge
+  const score = data.score;
+  const angle = (score + 100) / 200 * 180;
   const rad = angle * Math.PI / 180;
   const r = 70, cx = 100, cy = 90;
   const nx = cx + r * Math.sin(rad), ny = cy - r * Math.cos(rad);
-  const bearArc = 'M ' + (cx-r) + ',' + cy + ' A ' + r + ',' + r + ' 0 0,0 ' + cx + ',' + (cy-r);
-  const bullArc = 'M ' + cx + ',' + (cy-r) + ' A ' + r + ',' + r + ' 0 0,0 ' + (cx+r) + ',' + cy;
+  const bearArc = "M " + (cx-r) + "," + cy + " A " + r + "," + r + " 0 0,0 " + cx + "," + (cy-r);
+  const bullArc = "M " + cx + "," + (cy-r) + " A " + r + "," + r + " 0 0,0 " + (cx+r) + "," + cy;
   let ticksHtml = '';
   [-100,-50,0,50,100].forEach(function(v) {
     const a = (v + 100) / 200 * 180 * Math.PI / 180;
-    const tx = cx + (r + 6) * Math.sin(a), ty = cy - (r + 6) * Math.cos(a);
-    ticksHtml += '<span style="position:absolute;font-size:10px;color:#7a7e86;left:' + (tx+85) + 'px;top:' + (ty-2) + 'px;transform:translate(-50%,-50%)">' + v + '</span>';
+    const tx = cx + (r + 8) * Math.sin(a);
+    const ty = cy - (r + 8) * Math.cos(a);
+    ticksHtml += '<span style="position:absolute;font-size:10px;color:#8f96a3;left:' + (tx+45) + 'px;top:' + (ty-2) + 'px;transform:translate(-50%,-50%)">' + v + '</span>';
   });
-  document.getElementById('gaugeContainer').innerHTML =
-    '<div style="position:relative;text-align:center">' +
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120" class="gauge-svg">' +
-    '<path d="' + bearArc + '" stroke="#cc4444" stroke-width="10" fill="none" stroke-linecap="round" opacity="0.6"/>' +
-    '<path d="' + bullArc + '" stroke="#00cc66" stroke-width="10" fill="none" stroke-linecap="round" opacity="0.6"/>' +
-    '<path d="M ' + (cx-r-2) + ',' + cy + ' A ' + (r+2) + ',' + (r+2) + ' 0 0,0 ' + (cx+r+2) + ',' + cy + '" stroke="#252830" stroke-width="1" fill="none"/>' +
-    '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r-8) + '" fill="#11131c" opacity="0.5"/>' +
-    '<line x1="' + cx + '" y1="' + cy + '" x2="' + nx + '" y2="' + ny + '" stroke="#e8eaed" stroke-width="2.5" stroke-linecap="round"/>' +
-    '<circle cx="' + cx + '" cy="' + cy + '" r="4" fill="#e8eaed"/>' +
-    '</svg>' + ticksHtml +
-    '<span style="position:absolute;left:18px;bottom:4px;font-size:11px;color:#cc4444;font-weight:500">Bear</span>' +
-    '<span style="position:absolute;right:18px;bottom:4px;font-size:11px;color:#00cc66;font-weight:500">Bull</span>' +
-    '<div class="gl" style="color:' + D.c + '">' + D.l + '</div>' +
-    '<div class="gv">' + (D.cmp >= 0 ? '+' : '') + D.cmp + ' / 100</div>' +
-    '</div>';
-}
 
-function renderSummary() {
+  // Determine sentiment color
+  let labelColor = "#f1c40f";
+  if (score > 50) labelColor = "#00cc66";
+  else if (score > 15) labelColor = "#88cc44";
+  else if (score < -50) labelColor = "#cc4444";
+  else if (score < -15) labelColor = "#cc8844";
+
+  document.getElementById('gaugeWrap').innerHTML = `
+    <div style="position:relative;text-align:center">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120" class="gauge-svg">
+      <path d="` + bearArc + `" stroke="#e74c3c" stroke-width="12" fill="none" stroke-linecap="round" opacity="0.8"/>
+      <path d="` + bullArc + `" stroke="#00cc66" stroke-width="12" fill="none" stroke-linecap="round" opacity="0.8"/>
+      <path d="M ` + (cx-r-2) + `,` + cy + ` A ` + (r+2) + `,` + (r+2) + ` 0 0,0 ` + (cx+r+2) + `,` + cy + `" stroke="#1f2330" stroke-width="1" fill="none"/>
+      <circle cx="` + cx + `" cy="` + cy + `" r="` + (r-8) + `" fill="#0e1118" opacity="0.5"/>
+      <line x1="` + cx + `" y1="` + cy + `" x2="` + nx + `" y2="` + ny + `" stroke="#e8eaed" stroke-width="3" stroke-linecap="round"/>
+      <circle cx="` + cx + `" cy="` + cy + `" r="5" fill="#e8eaed"/>
+    </svg>` + ticksHtml + `
+    <div class="gl" style="color:` + labelColor + `">` + getScoreLabel(score) + `</div>
+    <div class="gv">` + (score >= 0 ? '+' : '') + score + ` / 100</div>
+    </div>
+  `;
+
+  // 3. Side Quant Cards
+  // VRP
+  document.getElementById('vraVal').textContent = data.vrp.toFixed(1) + ' pts';
+  // Spread
+  document.getElementById('tslVal').textContent = data.tsl.toFixed(1) + ' vol pts';
+
+  // 4. HMM Mode Alert
+  const hmmCard = document.getElementById('hmmModeCard');
+  const signalVal = document.getElementById('hmmSignalVal');
+  const probVal = document.getElementById('hmmProbVal');
+  if (data.hmm_signal) {
+    hmmCard.className = "hmm-indicator active";
+    signalVal.textContent = "BUY / LONG";
+    signalVal.style.color = "#00cc66";
+  } else {
+    hmmCard.className = "hmm-indicator inactive";
+    signalVal.textContent = "NEUTRAL / CASH";
+    signalVal.style.color = "#e74c3c";
+  }
+  probVal.textContent = 'P(Calm today): ' + data.hmm_prob_today + '% | P(Calm tmr): ' + data.hmm_prob_tmr + '%';
+
+  // 5. Render Iron Condor Moves Reference Table 
+  const tableBody = document.getElementById('condorTableBody');
+  tableBody.innerHTML = '';
+  if (data.hmm_move_table && data.hmm_move_table.length > 0) {
+    data.hmm_move_table.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="font-weight:bold;color:#fff">` + row.horizon + `</td>
+        <td style="color:#00cc66">` + row.implied + `</td>
+        <td style="color:#8f96a3">` + row.historical + `</td>
+        <td style="color:#2a6cff;font-weight:bold">` + row.spot_implied + `</td>
+      `;
+      tableBody.appendChild(tr);
+    });
+  } else {
+    tableBody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:#8f96a3">No move matrix compiled</td></tr>`;
+  }
+
+  // 6. Structure Bullets
+  const bulletsBox = document.getElementById('bulletsBox');
+  bulletsBox.innerHTML = '';
   const ul = document.createElement('ul');
-  D.s.forEach(function(b) {
+  
+  const bullets = [
+    'Implied Vol (ATM 30d): ' + data.aiv.toFixed(1) + '% | VIX Base level: ' + data.vix.toFixed(1) + '%',
+    'Skew Steepness Premium: 25d option slope is ' + data.psk.toFixed(1) + ' vol pts (5d Change: ' + data.d_skew.toFixed(1) + ' pts)',
+    'Wings Fly Curvature: 25d butterfly represents ' + data.bfly.toFixed(1) + ' vol pts (5d Change: ' + data.d_bfly.toFixed(1) + ' pts)',
+    'PCA Delta Systemic Shocks: PC1 (Shift) = ' + data.pc1.toFixed(2) + ' | PC2 (Skew Tilt) = ' + data.pc2.toFixed(2) + '',
+    'Structural Joint Flag: PCA classified as [' + data.joint_signal + ']',
+    'Market Volatility Regime: HMM classified present status as [' + data.hmm_regime.toUpperCase() + ']'
+  ];
+
+  bullets.forEach(b => {
     const li = document.createElement('li');
     li.textContent = b;
     ul.appendChild(li);
   });
-  document.getElementById('summaryContainer').appendChild(ul);
+  bulletsBox.appendChild(ul);
 }
 
-function setMode(m) {
-  currentMode = m;
-  document.getElementById('btnIV').className = 'rb' + (m === 'iv' ? ' active' : '');
-  document.getElementById('btnLV').className = 'rb' + (m === 'lv' ? ' active' : '');
-  renderSurface(m);
+// Helpers
+function getScoreLabel(score) {
+  if (score > 50) return "Extremely Bullish";
+  if (score > 15) return "Slightly Bullish";
+  if (score > -15) return "Neutral";
+  if (score > -50) return "Slightly Bearish";
+  return "Extremely Bearish";
 }
 
-// init
-document.getElementById('dateBadge').textContent = D.t;
-document.getElementById('spotBadge').textContent = 'SPX ' + D.sp.toLocaleString();
-renderSurface('iv');
-renderGauge();
-renderSummary();
-</script></body></html>"""
+function switchIndex(idx) {
+  currentIdx = idx;
+  const btns = document.querySelectorAll('.tab-btn');
+  btns.forEach(b => {
+    if (b.textContent.includes(idx)) b.classList.add('active');
+    else b.classList.remove('active');
+  });
+  renderAll();
+}
 
-PORT = int(os.environ.get("PORT", 8050))
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('btnIV').className = 'rb' + (mode === 'iv' ? ' active' : '');
+  document.getElementById('btnLV').className = 'rb' + (mode === 'lv' ? ' active' : '');
+  renderAll();
+}
+
+// Fetch in loop
+fetchServerData();
+setInterval(fetchServerData, 300000); // 5 min interval update
+</script>
+</body>
+</html>
+"""
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -197,13 +498,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML.encode("utf-8"))
+        elif parsed.path == "/api/signals":
+            try:
+                data_dict = engine.run_pipeline()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(data_dict).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
-    def log_message(self, fmt, *args):
-        print(f"  [{self.address_string()}] {args[0]} {args[1]} {args[2]}")
+            
+    def log_message(self, format, *args):
+        # Silence annoying routing logs
+        pass
 
-print(f"\n  >>> Dashboard running at http://127.0.0.1:{PORT}  <<<\n")
+print(f"\n  >>> Index Quant Hub Running at http://127.0.0.1:{PORT}  <<<\n")
 server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
 try:
     server.serve_forever()

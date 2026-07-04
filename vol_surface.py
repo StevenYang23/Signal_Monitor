@@ -2250,6 +2250,205 @@ class VolSurfaceStudy:
             "today": today_d,
         }
 
+    def plot_bloomberg_3d_surface(
+        self,
+        asof: date | None = None,
+        max_dte: int | None = None,
+    ) -> Any:
+        """Bloomberg-style 3D IV and Local Vol surface with selection gridded on Moneyness (K/S)."""
+        import plotly.graph_objects as go
+        if not self.surfaces:
+            self.load_history()
+        asof = asof or latest_business_session(self.surfaces)
+        df_today = self.surfaces[asof]
+        spot = float(df_today["spot"].iloc[0])
+        max_dte = max_dte or self.cfg.max_dte
+
+        g_dte, g_ks, iv_g = build_iv_grid(df_today, max_dte=max_dte)
+        lv = dupire_local_vol(spot, g_dte, g_ks, iv_g, r=self.cfg.risk_free_rate)
+
+        x_ks = g_ks[0, :]
+        y_dte = g_dte[:, 0]
+
+        fig = go.Figure()
+        fig.add_trace(go.Surface(
+            x=x_ks, y=y_dte, z=iv_g,
+            name="Implied Vol", colorscale="Viridis", visible=True,
+            colorbar=dict(title="IV (%)", x=1.02),
+        ))
+        fig.add_trace(go.Surface(
+            x=x_ks, y=y_dte, z=lv,
+            name="Local Vol", colorscale="Magma", visible=False,
+            colorbar=dict(title="Local Vol (%)", x=1.02),
+        ))
+        fig.update_layout(
+            scene=dict(
+                xaxis_title="Moneyness (K/S)", yaxis_title="DTE", zaxis_title="Vol (%)",
+                aspectmode="manual", aspectratio=dict(x=1.0, y=1.2, z=0.6),
+                camera=dict(eye=dict(x=-1.5, y=-1.5, z=0.8)),
+            ),
+            title=f"{self.cfg.underlying} - {asof} (Moneyness K/S)",
+            updatemenus=[dict(
+                type="buttons", direction="right", x=0.5, y=1.1, xanchor="center",
+                buttons=[
+                    dict(label="IV", method="update",
+                         args=[{"visible": [True, False]},
+                               {"scene.zaxis.title": "IV (%)"}]),
+                    dict(label="Local Vol", method="update",
+                         args=[{"visible": [False, True]},
+                               {"scene.zaxis.title": "Local Vol (%)"}]),
+                ],
+            )],
+            width=820, height=580,
+        )
+        return fig
+
+    def plot_sentiment_gauge(
+        self,
+        result: dict[str, Any],
+        today_scores: np.ndarray,
+        sentiment: dict[str, Any],
+    ) -> Any:
+        """Render a dual-panel Matte-Speedometer Gauge + Short Environment Summary."""
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+
+        today_d = latest_business_session(self.surfaces)
+        today_f = self.features[today_d]
+        aiv = float(today_f.get("atm_iv_30d", np.nan))
+        psk = float(today_f.get("skew_25d", np.nan))
+        tsl = float(today_f.get("term_slope", np.nan))
+        vix = float(result.get("vix_context", {}).get("vix", np.nan))
+
+        anomalies = result["anomalies"]
+        if result["changes"] is not None and not result["changes"].empty:
+            chg = result["changes"]
+            def d5(name):
+                row = chg.loc[chg["feature"]==name]
+                return float(row["delta_5d"].iloc[0]) if not row.empty and np.isfinite(row["delta_5d"].iloc[0]) else 0.0
+            d_skew = d5("skew_25d")
+            d_bfly = d5("butterfly_25d")
+        else:
+            d_skew = 0.0
+            d_bfly = 0.0
+
+        vrp_val = result.get("vix_context", {}).get("vrp", vix - aiv)
+        anchor_ctx = result.get("anchor_context", {})
+        anchor_changes = anchor_ctx.get("changes", {})
+        skew_proxy_chg = anchor_changes.get("skew_proxy", 0.0)
+
+        ps = np.clip(-psk * 4.0, -35, 35)
+        ts_factor = np.clip(tsl * 5.0, -25, 25)
+        vix_component = np.clip((20.0 - vix) * 2.0, -20, 20) if np.isfinite(vix) else 0.0
+        vrp_factor = np.clip((6.0 - vrp_val) * 2.5, -15, 15) if np.isfinite(vrp_val) else 0.0
+        anchor_skew_factor = np.clip(-skew_proxy_chg * 5.0, -10, 10) if np.isfinite(skew_proxy_chg) else 0.0
+
+        sentiment_score = float(np.clip(ps + ts_factor + vix_component + vrp_factor + anchor_skew_factor, -100, 100))
+
+        if sentiment_score > 50:
+            sentiment_label = "Extremely Bullish"
+            sentiment_color = "#27ae60"
+        elif sentiment_score > 15:
+            sentiment_label = "Slightly Bullish"
+            sentiment_color = "#2ecc71"
+        elif sentiment_score > -15:
+            sentiment_label = "Neutral"
+            sentiment_color = "#f1c40f"
+        elif sentiment_score > -50:
+            sentiment_label = "Slightly Bearish"
+            sentiment_color = "#e67e22"
+        else:
+            sentiment_label = "Extremely Bearish"
+            sentiment_color = "#e74c3c"
+
+        fig, (ax_gauge, ax_text) = plt.subplots(1, 2, figsize=(12, 4.5), gridspec_kw={'width_ratios': [1, 1.25]})
+
+        # Speedometer Gauge
+        r_outer = 1.0
+        r_inner = 0.7
+        colors = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#27ae60"]
+        angles = np.linspace(np.pi, 0, 6)
+
+        for i in range(5):
+            t_seg = np.linspace(angles[i], angles[i+1], 50)
+            x_outer = r_outer * np.cos(t_seg)
+            y_outer = r_outer * np.sin(t_seg)
+            x_inner = r_inner * np.cos(t_seg)
+            y_inner = r_inner * np.sin(t_seg)
+            x_polygon = np.concatenate([x_outer, x_inner[::-1]])
+            y_polygon = np.concatenate([y_outer, y_inner[::-1]])
+            ax_gauge.fill(x_polygon, y_polygon, color=colors[i], alpha=0.85)
+
+        normalized_score = (sentiment_score + 100.0) / 200.0
+        needle_angle = np.pi - normalized_score * np.pi
+
+        needle_len = 0.95
+        ax_gauge.annotate(
+            "",
+            xy=(needle_len * np.cos(needle_angle), needle_len * np.sin(needle_angle)),
+            xytext=(0, 0),
+            arrowprops=dict(arrowstyle="wedge,tail_width=0.35,shrink_factor=0.5", color="#2c3e50", zorder=10)
+        )
+
+        center_circle = patches.Circle((0, 0), 0.12, color="#2c3e50", zorder=11)
+        center_rim = patches.Circle((0, 0), 0.15, fill=False, edgecolor="#7f8c8d", lw=1.5, zorder=12)
+        ax_gauge.add_patch(center_circle)
+        ax_gauge.add_patch(center_rim)
+
+        ticks = [-100, -50, 0, 50, 100]
+        for val in ticks:
+            t_val = np.pi - ((val + 100.0) / 200.0) * np.pi
+            tx = (r_outer + 0.12) * np.cos(t_val)
+            ty = (r_outer + 0.12) * np.sin(t_val)
+            ax_gauge.text(tx, ty, str(val), ha="center", va="center", fontsize=9, fontweight="bold", color="#7f8c8d")
+
+        ax_gauge.text(0, -0.15, sentiment_label, ha="center", va="center", fontsize=15, fontweight="bold", color=sentiment_color)
+        ax_gauge.text(0, -0.32, f"Sentiment Score: {sentiment_score:+.1f} / 100", ha="center", va="center", fontsize=11, fontweight="bold", color="#34495e")
+
+        ax_gauge.set_xlim(-1.25, 1.25)
+        ax_gauge.set_ylim(-0.45, 1.25)
+        ax_gauge.axis("off")
+
+        # Bullets Summary
+        ax_text.axis("off")
+        box = patches.FancyBboxPatch(
+            (0.01, 0.01), 0.98, 0.98,
+            boxstyle="round,pad=0.03",
+            facecolor="#fdfefe", edgecolor="#d5dbdb", lw=1.5
+        )
+        ax_text.add_patch(box)
+
+        joint_flag_str = sentiment["joint_flags"][0].upper().replace("_", " ") if sentiment["joint_flags"] else "NEUTRAL"
+        pc1_score = today_scores[0]
+        pc2_score = today_scores[1]
+
+        hump_active = anomalies.get("event_hump", False)
+        term_narrative = f"Hump @ {anomalies.get('hump_dte', 0):.0f}d" if hump_active else "No Hump"
+        bfly_today = today_f.get("butterfly_25d", np.nan)
+
+        bullet_points = [
+            f"# Market Volatility Structure (As of {today_d})",
+            f"• Implied Pricing: ATM 30d IV = {aiv:.1f}% | VIX index baseline = {vix:.1f}%",
+            f"• Vol Risk Premium (VRP): {vrp_val:+.1f} pts (VIX premium over 22d Realized Vol)",
+            f"• Put/Call Skew Premium: 25d put spread skew = {psk:+.1f} vol pts (5d delta: {d_skew:+.1f} pts)",
+            f"• Curvature & Fly Convexity: 25d butterfly = {bfly_today:+.1f} vol pts (5d delta: {d_bfly:+.1f} pts)",
+            f"• Term Structure Tenor: Front vs back roll spread = {tsl:+.1f} vol pts ({term_narrative})",
+            f"• Surface Delta PCA Shocks: PC1 parallel shift = {pc1_score:+.2f} | PC2 skew tilt = {pc2_score:+.2f}",
+        ]
+
+        y_pos = 0.88
+        for line in bullet_points:
+            is_header = line.startswith("#")
+            display_line = line.replace("# ", "") if is_header else line
+            font_w = "bold" if is_header else "normal"
+            font_s = 12 if is_header else 10.2
+            font_c = "#2c3e50" if is_header else "#34495e"
+            ax_text.text(0.05, y_pos, display_line, fontsize=font_s, fontweight=font_w, color=font_c, va="center")
+            y_pos -= 0.12
+
+        plt.tight_layout()
+        plt.show()
+
     def print_conclusion(self, *, delta_lo: float = -0.05, delta_hi: float = 0.05) -> None:
         print(build_study_conclusion(self, delta_lo=delta_lo, delta_hi=delta_hi))
 
