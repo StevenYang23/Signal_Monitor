@@ -2,9 +2,23 @@
 
 ![Index Quant Signal Hub — SPX Dashboard](demo/signal_page.png)
 
-*Index Quant Signal Hub — integrated 3D volatility surface, sentiment compass, HMM regime signals, VRP/term-structure metrics, and 1-sigma move targets for SPX, IXIC, and DJI.*
+*Index Quant Signal Hub — integrated 3D volatility surface, sentiment compass, HMM regime signals, VRP/term-structure metrics, and 1-sigma move targets for **SPX, NDX, and DJI**.*
 
-*Index Quant Signal Hub — 集成 3D 波动率曲面、情绪罗盘、HMM 机制信号、VRP/期限结构指标及 1-sigma 波动目标，覆盖 SPX、IXIC、DJI 三大指数。*
+*Index Quant Signal Hub — 集成 3D 波动率曲面、情绪罗盘、HMM 机制信号、VRP/期限结构指标及 1-sigma 波动目标，覆盖 **SPX、NDX、DJI** 三大指数。*
+
+---
+
+## Index Coverage & Data Mapping / 指数覆盖与数据源映射
+
+The live dashboard tab labels match the indices below. Option surfaces are pulled from Futu OpenD; spot references use Yahoo Finance; HMM regime models use the internal market keys in [volatility_regime.py](volatility_regime.py).
+
+看板标签与底层数据映射如下（期权链来自富途 OpenD，现货参考来自 Yahoo Finance）：
+
+| Tab | Options (Futu) | Spot (Yahoo) | HMM market key | Notes |
+|-----|------------------|--------------|----------------|-------|
+| **SPX** | `US..SPX` | `^SPX` | `SPX` | S&P 500 index options |
+| **NDX** | `US..NDX` | `^NDX` | `NSDQ` | Nasdaq-100 index options |
+| **DJI** | `US.DIA` | `^DJI` | `DJI` | Dow Jones — IV surface uses **DIA ETF options** as proxy |
 
 ---
 
@@ -36,8 +50,16 @@ The system consists of interactive research walk-throughs in [research/](researc
   [volatility_regime.py](volatility_regime.py) 采用滑动窗口（通常为 504 个交易日，即 2 年）来实时拟合两状态高斯隐马尔可夫模型，将指数划分为“低波缓牛机制”和“高波震荡机制”。具体的全样本回测见 [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb)。
 
 - **Live Production App / 实时看板应用**：
-  [app.py](app.py) consolidates core calculations into a lightweight, high-performance HTML/web server exposing terminal plots, live Futu API options fetch, synthetic fallback models, 3D surface meshes, and trade signal gauges.
-  [app.py](app.py) 汇总所有量化计算模块，在本地暴露一个轻量化、高性能的交互式 Web 服务。支持实时对接富途 OpenAPI 提取最新期权，并提供备用合成曲面方案、3D 隐含与局部波交互图及罗盘时速表。
+  [app.py](app.py) consolidates core calculations into a lightweight HTTP dashboard at `http://127.0.0.1:8050`. On startup it **preloads SPX, NDX, and DJI in parallel** (background workers + frontend polling). Each tab shows:
+  - **3D vol surface** (Raw IV / Smooth IV / Arb-free Local Vol) on a transparent dark-theme canvas
+  - **Quant Sentiment Compass** (horizontal −100…+100 thermometer)
+  - **HMM Signal Window** (candlesticks + close line, red high-vol regime shading, today marker)
+  - **Sidebar:** HMM trade signal, VRP, term-structure roll spread, 1-sigma move table, DeepSeek-enhanced structure metrics, RV vs IV chart
+
+  [app.py](app.py) 汇总所有量化计算模块，暴露轻量 Web 看板（默认端口 `8050`）。**SPX / NDX / DJI 三个指数并行后台加载**，页面在未就绪前留白。各标签页包含：3D 波动率曲面（Raw / Smooth / Local Vol）、情绪罗盘、HMM 信号窗（K 线 + 高波红色 shading）、侧边栏机制信号、VRP、期限结构、1-sigma 目标位、DeepSeek 结构指标解读及 RV vs IV 图。
+
+  End-to-end workflow notebook: [trading_signal.ipynb](trading_signal.ipynb)
+  完整研究/信号流程见 [trading_signal.ipynb](trading_signal.ipynb)
 
 - **Robust Ingestion Engine / 数据获取引擎**：
   [data_fetcher.py](data_fetcher.py) guarantees rate-limited, crash-safe, and cached downloads from both Yahoo Finance and Futu API.
@@ -119,7 +141,7 @@ Install the Python environment inside VS Code or in your shell:
 在您的本地 Python 环境中安装必要依赖：
 
 ```bash
-pip install numpy pandas matplotlib yfinance hmmlearn scikit-learn scipy plotly
+pip install numpy pandas matplotlib yfinance hmmlearn scikit-learn scipy plotly futu-api
 ```
 
 If you have a Futu OpenAPI subscription and intend to pull real-time cash options chains, ensure your FutuOpenD setup is active on port `11111` or configure your settings in [vol_surface.py](vol_surface.py). Otherwise, the code will seamlessly auto-generate highly realistic simulated synthetics and cache metrics locally.
@@ -127,18 +149,46 @@ If you have a Futu OpenAPI subscription and intend to pull real-time cash option
 如果您配置了富途 OpenAPI 并在本地开通了 FutuOpenD (默认端口 `11111`)，本系统可直接获取美股实时多期限期权链。如未开启，系统将自动平滑切换至高度逼真的模拟合成波动面，并实现本地无缝缓存。
 
 ### 1. Run Interactive Notebook Studies / 交互式回测与模型调试
-Open the notebooks inside [research/](research/) to explore the mathematics step-by-step:
-在 VS Code 内部直接加载 [research/](research/) 目录下的 Jupyter Notebooks：
+Open the notebooks inside [research/](research/) or the root workflow notebook to explore step-by-step:
+在 VS Code 内加载以下 Notebook 进行交互式研究：
+
+- **End-to-end signal workflow (surfaces + HMM + gauges):** [trading_signal.ipynb](trading_signal.ipynb)
 - **Volatility Surface & PCA Sentiment Study:** [research/vol_surface_study.ipynb](research/vol_surface_study.ipynb)
 - **HMM Walk-Forward Regime Transition Backtest:** [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb)
 
 ### 2. Run Live Production Dashboard / 启动本地交互式看板
-Run the server from your terminal inside the project root:
-在项目根目录下通过终端开启可视化平台：
+
+**Prerequisites / 前置条件**
+- Futu **OpenD** running locally (`127.0.0.1:11111`) for live option chains
+- Python env with dependencies below
+- Optional: DeepSeek API key for AI structure-metric insights (`USE_DEEPSEEK=1`, key in `.env` as `deepseek=...` or env var `DEEPSEEK_API_KEY`)
+
+Run the server from the project root:
+
+在项目根目录启动服务：
 
 ```bash
 python app.py
 ```
-After initialization, open your browser and navigate to `http://localhost:8050` to inspect interactive 3D options surfaces, current Dupire local vol matrices, HMM state breakdowns, and consolidated global equity risk indicators.
 
-启动后在浏览器访问 `http://localhost:8050` 便可无缝查看 3D 隐含波局部波曲面、HMM 后验概率走势、美股三大核心指数的实时罗盘雷达。
+Windows (conda example):
+
+```powershell
+& C:\Users\Lenovo\miniconda3\envs\env2\python.exe app.py
+```
+
+Then open **`http://127.0.0.1:8050`** in your browser. Use **Ctrl+Shift+R** after code updates. Keep the terminal running (do not Ctrl+C) while using the dashboard.
+
+浏览器访问 **`http://127.0.0.1:8050`**。代码更新后请 **Ctrl+Shift+R** 强制刷新。使用看板期间请保持终端进程运行。
+
+**Environment variables / 环境变量**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8050` | HTTP server port |
+| `USE_DEEPSEEK` | `1` | Set `0` to disable DeepSeek insight rewriting |
+| `DEEPSEEK_API_KEY` | — | API key (or `deepseek=` in `.env`) |
+
+If OpenD is offline, the pipeline falls back to cached/demo surfaces automatically.
+
+若 Futu OpenD 未启动，系统自动使用本地缓存或 demo 合成曲面，不会无限阻塞。

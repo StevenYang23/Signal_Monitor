@@ -166,11 +166,12 @@ class SurfaceDeltaPCA:
             # use day-over-day changes instead so we don't crash with standard scaling or empty arrays.
             valid_count = (np.abs(D).sum(axis=1) > 1e-10).sum()
             if valid_count < min(cfg.n_components, len(X) - 1) or valid_count < 2:
-                logger.warning(
-                    "Not enough valid rolling delta-surfaces (%d) to fit PCA components (%d) or StandardScale safely. "
-                    "Falling back to 'prev' (day-over-day change).",
-                    valid_count, cfg.n_components,
-                )
+                if len(X) >= 2:
+                    logger.warning(
+                        "Not enough valid rolling delta-surfaces (%d) to fit PCA components (%d) or StandardScale safely. "
+                        "Falling back to 'prev' (day-over-day change).",
+                        valid_count, cfg.n_components,
+                    )
                 D = np.zeros_like(X)
                 D[1:] = X[1:] - X[:-1]
  

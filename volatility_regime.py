@@ -113,10 +113,16 @@ class HMMVolatilityRegime:
 
     def download_data(self) -> pd.DataFrame:
         underly = self._download_close(self.underly_ticker).rename("SPX")
-        vol = self._download_close(self.vol_ticker).rename("VIX")
+        try:
+            vol = self._download_close(self.vol_ticker).rename("VIX")
+        except ValueError:
+            vol = pd.Series(dtype=float, name="VIX")
         prices = pd.concat([underly, vol], axis=1).sort_index()
-        # Vol indices (e.g. ^VXD) can miss days; keep all underly dates and carry vol forward.
         prices["VIX"] = prices["VIX"].ffill()
+        # ^VXD / ^VXN can be sparse on yfinance; use 22d RV as vol proxy when needed.
+        if prices["VIX"].notna().sum() < 50:
+            ret = np.log(prices["SPX"] / prices["SPX"].shift(1))
+            prices["VIX"] = ret.rolling(22).std() * np.sqrt(self.trading_days) * 100
         self.prices = prices.dropna(subset=["SPX", "VIX"])
         return self.prices
 

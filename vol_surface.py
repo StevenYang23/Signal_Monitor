@@ -37,6 +37,7 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 # Index underlyings: Futu index snapshots often require extra permissions yfinance.
 SPOT_YF_DEFAULT: dict[str, str] = {
     "US..SPX": "^SPX",
+    "US..NDX": "^NDX",
     "US..IXIC": "^IXIC",
     "US..DJI": "^DJI",
     "US.QQQ": "QQQ",
@@ -430,13 +431,14 @@ def load_surface_history(cfg: VolSurfaceConfig, n_days: int | None = None) -> di
     return history
 
 
-def fetch_and_cache(cfg: VolSurfaceConfig | None = None) -> pd.DataFrame:
+def fetch_and_cache(cfg: VolSurfaceConfig | None = None, *, save: bool = True) -> pd.DataFrame:
     cfg = cfg or VolSurfaceConfig()
     _require_futu()
     quote_ctx = ft.OpenQuoteContext(host=cfg.host, port=cfg.port)
     try:
         df = fetch_option_chain_futu(quote_ctx, cfg)
-        save_surface(df, cfg)
+        if save:
+            save_surface(df, cfg)
         return df
     finally:
         quote_ctx.close()
@@ -1705,6 +1707,340 @@ def format_anchor_commentary(anchor_ctx: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _series_daily_deltas(series: pd.Series) -> np.ndarray:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
+        return np.array([])
+    return np.diff(s.to_numpy(dtype=float))
+
+
+def _consecutive_streak(deltas: np.ndarray) -> tuple[int, str]:
+    if len(deltas) == 0:
+        return 0, "flat"
+    sign = float(np.sign(deltas[-1]))
+    if sign == 0:
+        return 0, "flat"
+    streak = 1
+    for i in range(len(deltas) - 2, -1, -1):
+        if np.sign(deltas[i]) == sign:
+            streak += 1
+        else:
+            break
+    return streak, "up" if sign > 0 else "down"
+
+
+def _today_vs_recent(deltas: np.ndarray) -> tuple[str, float]:
+    """Classify whether the latest daily move is typical or an outlier."""
+    if len(deltas) < 2:
+        return "insufficient history", 0.0
+    today = float(deltas[-1])
+    prior = deltas[:-1]
+    if len(prior) == 0:
+        return "insufficient history", 0.0
+    mean = float(np.mean(prior))
+    std = float(np.std(prior)) or max(abs(mean), 0.05)
+    z = (today - mean) / std
+    if abs(z) >= 2.0:
+        tag = "today is an outlier vs the recent rhythm"
+    elif abs(z) >= 1.2:
+        tag = "today is somewhat sharper than recent days"
+    elif abs(today) < 0.05 and abs(mean) < 0.05:
+        tag = "surface has been quiet with little day-to-day change"
+    else:
+        tag = "today continues the recent day-to-day pattern"
+    return tag, z
+
+
+def _pc_intensity_label(z: float, *, pos_label: str, neg_label: str, mild_threshold: float = 1.0) -> str:
+    if z >= mild_threshold:
+        return pos_label
+    if z <= -mild_threshold:
+        return neg_label
+    return "little net tilt in this mode today"
+
+
+def build_structure_metrics_insights(
+    today: dict[str, Any],
+    vix_ctx: dict[str, Any] | None,
+    anchor_ctx: dict[str, Any] | None,
+    today_scores: list[float] | np.ndarray,
+    pca_sentiment: dict[str, Any] | None,
+    pca_score_history: np.ndarray | None = None,
+    changes: pd.DataFrame | None = None,
+) -> list[dict[str, str]]:
+    """Rule-based metric lines + natural-language insights for the structure panel."""
+    vix_ctx = vix_ctx or {}
+    anchor_ctx = anchor_ctx or {}
+    scores = np.asarray(today_scores, dtype=float) if today_scores is not None else np.zeros(4)
+    pc1 = float(scores[0]) if len(scores) > 0 else 0.0
+    pc2 = float(scores[1]) if len(scores) > 1 else 0.0
+    pc3 = float(scores[2]) if len(scores) > 2 else 0.0
+
+    aiv = float(today.get("atm_iv_30d", np.nan))
+    vix = float(vix_ctx.get("vix", np.nan))
+    vrp = float(vix_ctx.get("vrp", np.nan)) if np.isfinite(vix_ctx.get("vrp", np.nan)) else (
+        vix - aiv if np.isfinite(vix) and np.isfinite(aiv) else np.nan
+    )
+    vix_chg_5d = float(vix_ctx.get("vix_change_5d", np.nan))
+    psk = float(today.get("skew_25d", np.nan))
+    call_sk = float(today.get("call_skew_25d", np.nan))
+    bfly = float(today.get("butterfly_25d", np.nan))
+    tsl = float(today.get("term_slope", np.nan))
+
+    def _delta5(name: str) -> float:
+        if changes is None or changes.empty or "delta_5d" not in changes.columns:
+            return 0.0
+        row = changes.loc[changes["feature"] == name]
+        if row.empty:
+            return 0.0
+        val = row["delta_5d"].iloc[0]
+        return float(val) if np.isfinite(val) else 0.0
+
+    d_skew = _delta5("skew_25d")
+    d_bfly = _delta5("butterfly_25d")
+    d_call = _delta5("call_skew_25d")
+    d_atm = _delta5("atm_iv_30d")
+
+    anchor_series = anchor_ctx.get("series")
+    anchor_changes = anchor_ctx.get("changes") or {}
+    atm_deltas = np.array([])
+    skew_deltas = np.array([])
+    call_deltas = np.array([])
+    if isinstance(anchor_series, pd.DataFrame) and not anchor_series.empty:
+        if "atm_30d_call" in anchor_series.columns:
+            atm_deltas = _series_daily_deltas(anchor_series["atm_30d_call"])
+        if "skew_proxy" in anchor_series.columns:
+            skew_deltas = _series_daily_deltas(anchor_series["skew_proxy"])
+        elif "put_25d_30d" in anchor_series.columns and "atm_30d_call" in anchor_series.columns:
+            skew_deltas = _series_daily_deltas(
+                anchor_series["put_25d_30d"] - anchor_series["atm_30d_call"]
+            )
+        if "call_25d_30d" in anchor_series.columns and "atm_30d_call" in anchor_series.columns:
+            call_deltas = _series_daily_deltas(
+                anchor_series["call_25d_30d"] - anchor_series["atm_30d_call"]
+            )
+
+    # --- Vol level ---
+    vol_metric = f"Implied Vol (ATM 30d): {aiv:.1f}% | VIX Base level: {vix:.1f}%"
+    vol_parts: list[str] = []
+    if np.isfinite(vrp):
+        if vrp > 2:
+            vol_parts.append(f"VIX trades {vrp:.1f} vol pts above 22d realized — options embed a fear premium.")
+        elif vrp < -1:
+            vol_parts.append(f"ATM IV is {abs(vrp):.1f} pts above VIX — front-end implied vol looks rich vs the fear gauge.")
+        else:
+            vol_parts.append("ATM IV and VIX are roughly aligned — no extreme vol-risk premium dislocation.")
+    if np.isfinite(vix_chg_5d):
+        if vix_chg_5d > 1.5:
+            vol_parts.append(f"VIX has drifted up {vix_chg_5d:+.1f} pts over 5 sessions — vol level is creeping higher.")
+        elif vix_chg_5d < -1.5:
+            vol_parts.append(f"VIX has eased {vix_chg_5d:+.1f} pts over 5 sessions — the macro vol backdrop is softening.")
+    if len(atm_deltas) >= 2:
+        streak, direction = _consecutive_streak(atm_deltas)
+        rhythm, _ = _today_vs_recent(atm_deltas)
+        if streak >= 3:
+            vol_parts.append(
+                f"ATM 30d IV has moved {direction} for {streak} straight anchor sessions — a persistent level shift, not a one-day blip."
+            )
+        else:
+            vol_parts.append(f"Anchor ATM IV: {rhythm}.")
+    elif np.isfinite(d_atm) and abs(d_atm) > 0.3:
+        vol_parts.append(f"30d ATM IV is {d_atm:+.1f} vol pts vs the 5d reference — level is migrating.")
+    if not vol_parts:
+        vol_parts.append("Vol level looks stable; no strong multi-day drift in ATM IV or VIX.")
+
+    # --- Skew ---
+    skew_metric = (
+        f"Skew Steepness Premium: 25d option slope is {psk:.1f} vol pts (5d Change: {d_skew:.1f} pts)"
+    )
+    skew_parts: list[str] = []
+    if psk > 3:
+        skew_parts.append("Put wing is materially steeper than ATM — downside hedging is bid.")
+    elif psk < 0:
+        skew_parts.append("Skew is inverted/flat — puts are not commanding a large premium vs ATM.")
+    if np.isfinite(call_sk):
+        if call_sk > 1.5 and d_call > 0.5:
+            skew_parts.append(
+                f"25Δ call IV is elevated ({call_sk:+.1f} vol pts vs ATM) and rising — upside/convexity demand is lifting call wing IV."
+            )
+        elif call_sk > 1.5:
+            skew_parts.append(
+                f"Call wing IV sits {call_sk:+.1f} vol pts above ATM — upside strikes are relatively bid."
+            )
+        elif d_call < -0.5:
+            skew_parts.append("Call skew has compressed over 5d — upside hedges are cheaper vs puts.")
+    if len(skew_deltas) >= 2:
+        streak, direction = _consecutive_streak(skew_deltas)
+        rhythm, z = _today_vs_recent(skew_deltas)
+        if streak >= 3:
+            skew_parts.append(
+                f"Skew proxy has {'steepened' if direction == 'up' else 'flattened'} for {streak} consecutive sessions — a sustained tilt in the put/call balance."
+            )
+        elif abs(z) >= 1.5:
+            skew_parts.append(f"Today's skew move looks unusual ({rhythm}).")
+        elif abs(d_skew) > 0.5:
+            skew_parts.append(f"5d skew change of {d_skew:+.1f} pts confirms the wing repricing.")
+    elif abs(d_skew) > 0.3:
+        skew_parts.append(f"Skew has shifted {d_skew:+.1f} vol pts over 5d — watch whether puts or calls are driving the wing move.")
+    if not skew_parts:
+        skew_parts.append("Skew shape is near recent norms — no dominant put- or call-wing shock.")
+
+    # --- Butterfly ---
+    bfly_metric = (
+        f"Wings Fly Curvature: 25d butterfly represents {bfly:.1f} vol pts (5d Change: {d_bfly:.1f} pts)"
+    )
+    bfly_parts: list[str] = []
+    if bfly > 1.5:
+        bfly_parts.append("Wings are lifted vs belly — tail/convexity is being priced in (smile wings rich).")
+    elif bfly < -1.0:
+        bfly_parts.append("Butterfly is negative — wings trade cheap vs ATM; the smile is tight in the tails.")
+    if abs(d_bfly) > 0.5:
+        bfly_parts.append(f"5d butterfly change ({d_bfly:+.1f} pts) shows wings {'richening' if d_bfly > 0 else 'cheapening'} vs the body.")
+    if not bfly_parts:
+        bfly_parts.append("Wing curvature is muted — tail pricing is not the main story today.")
+
+    # --- PCA ---
+    pca_metric = f"PCA Delta Systemic Shocks: PC1 (Shift) = {pc1:.2f} | PC2 (Skew Tilt) = {pc2:.2f}"
+    pca_parts: list[str] = []
+    z_scores = (pca_sentiment or {}).get("z_scores") or []
+    z1 = float(z_scores[0]) if len(z_scores) > 0 else pc1
+    z2 = float(z_scores[1]) if len(z_scores) > 1 else pc2
+    z3 = float(z_scores[2]) if len(z_scores) > 2 else pc3
+
+    pca_parts.append(
+        _pc_intensity_label(
+            z1,
+            pos_label="PC1: broad parallel shift UP — the whole surface repriced higher across strikes/tenors (vol level shock).",
+            neg_label="PC1: broad parallel shift DOWN — systemic vol compression across the surface.",
+        )
+    )
+    pca_parts.append(
+        _pc_intensity_label(
+            z2,
+            pos_label="PC2: skew steepening — put-side IV rising faster than calls; downside protection demand dominates.",
+            neg_label="PC2: skew flattening — call wing IV bid up relative to puts; upside/convexity catching a bid.",
+            mild_threshold=0.8,
+        )
+    )
+    if abs(z3) >= 0.8:
+        pca_parts.append(
+            _pc_intensity_label(
+                z3,
+                pos_label="PC3: wing/tail curvature expanding — far OTM options repricing faster (tail risk bid).",
+                neg_label="PC3: wing curvature compressing — tails cheapening vs the belly.",
+                mild_threshold=0.8,
+            )
+        )
+
+    if pca_score_history is not None and len(pca_score_history) >= 3:
+        pc1_hist = pca_score_history[:, 0]
+        pc1_d = np.diff(pc1_hist)
+        streak, direction = _consecutive_streak(pc1_d)
+        rhythm, z = _today_vs_recent(pc1_d)
+        if streak >= 3:
+            pca_parts.append(
+                f"PC1 has moved the same direction for {streak} sessions — surface level shifts are stacking, not reversing."
+            )
+        elif abs(z) >= 1.5:
+            pca_parts.append(f"Today's PC1 move breaks the recent pattern ({rhythm}).")
+    elif len(atm_deltas) >= 2:
+        streak, _ = _consecutive_streak(atm_deltas)
+        rhythm, z = _today_vs_recent(atm_deltas)
+        if streak >= 3:
+            pca_parts.append(
+                f"Without full surface history, anchor ATM IV shows {streak} days of same-direction level drift — likely a sustained PC1-style shift."
+            )
+        elif abs(z) >= 1.5:
+            pca_parts.append(f"Today's ATM IV change stands out vs the past week ({rhythm}).")
+
+    if len(call_deltas) >= 2:
+        streak, direction = _consecutive_streak(call_deltas)
+        if streak >= 3 and direction == "up":
+            pca_parts.append(
+                f"Call-wing IV vs ATM has risen for {streak} straight sessions — consistent with PC2 call-skew bid."
+            )
+
+    if np.isfinite(tsl) and abs(tsl) > 2:
+        pca_parts.append(
+            f"Term slope {tsl:+.1f} vol pts — "
+            + ("front-end IV elevated vs back (event/near-term fear)." if tsl > 0 else "back-end IV holds up vs front (longer-dated uncertainty).")
+        )
+
+    return [
+        {"key": "vol_level", "metric": vol_metric, "insight": " ".join(vol_parts)},
+        {"key": "skew", "metric": skew_metric, "insight": " ".join(skew_parts)},
+        {"key": "butterfly", "metric": bfly_metric, "insight": " ".join(bfly_parts)},
+        {"key": "pca", "metric": pca_metric, "insight": " ".join(pca_parts)},
+    ]
+
+
+def deepseek_enhance_structure_insights(
+    metrics: list[dict[str, str]],
+    context: dict[str, Any],
+    api_key: str | None = None,
+) -> list[dict[str, str]]:
+    """Rewrite insight sentences with DeepSeek; falls back to rule-based text."""
+    api_key = api_key or load_deepseek_api_key()
+    if not api_key:
+        return metrics
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an equity index options strategist writing dashboard copy. "
+                    "For each metric block, rewrite ONLY the insight field: 1-2 crisp sentences, "
+                    "trader-facing, no bullet lists, no invented numbers, no price targets. "
+                    "Emphasize whether moves are multi-day streaks vs today's outlier, and PCA surface dynamics "
+                    "(level shift, skew tilt, call vs put wing). Return valid JSON array of "
+                    "objects with keys: key, metric, insight. Keep metric strings unchanged."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"blocks": metrics, "context": context}, default=str),
+            },
+        ],
+        "temperature": 0.35,
+        "response_format": {"type": "json_object"},
+    }
+    req = request.Request(
+        DEEPSEEK_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=90) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"].strip()
+        parsed = json.loads(content)
+        rows = parsed if isinstance(parsed, list) else parsed.get("blocks") or parsed.get("metrics") or []
+        if not isinstance(rows, list) or not rows:
+            return metrics
+        by_key = {str(r.get("key")): r for r in rows if isinstance(r, dict) and r.get("key")}
+        out: list[dict[str, str]] = []
+        for block in metrics:
+            key = block["key"]
+            if key in by_key and by_key[key].get("insight"):
+                out.append({
+                    "key": key,
+                    "metric": block["metric"],
+                    "insight": str(by_key[key]["insight"]).strip(),
+                })
+            else:
+                out.append(block)
+        return out
+    except (error.URLError, KeyError, json.JSONDecodeError, TypeError) as exc:
+        logger.warning("DeepSeek structure insights failed: %s", exc)
+        return metrics
+
+
 def build_commentary(
     today: dict[str, Any],
     changes: pd.DataFrame,
@@ -1791,12 +2127,28 @@ def build_commentary(
     return "\n".join(line for line in lines if line)
 
 
-def generate_demo_surfaces(cfg: VolSurfaceConfig | None = None, n_days: int = 6) -> dict[date, pd.DataFrame]:
-    """Synthetic SPX-like surfaces for offline notebook runs when OpenD is unavailable."""
+def generate_demo_surfaces(
+    cfg: VolSurfaceConfig | None = None,
+    n_days: int = 6,
+    *,
+    save: bool = True,
+) -> dict[date, pd.DataFrame]:
+    """Synthetic surfaces for offline runs when OpenD/cache is unavailable."""
     cfg = cfg or VolSurfaceConfig()
+    yf_spot = SPOT_YF_DEFAULT.get(cfg.underlying)
     spot0 = 5400.0
+    if yf_spot:
+        try:
+            spot0, _ = fetch_spot_yfinance(yf_spot)
+        except Exception:
+            spot0 = {"US..NDX": 21000.0, "US.DIA": 420.0}.get(cfg.underlying, 5400.0)
+    strike_step = max(1.0, round(spot0 * 0.005, 2))
+    strikes = np.arange(
+        spot0 * cfg.moneyness_min,
+        spot0 * cfg.moneyness_max + strike_step,
+        strike_step,
+    )
     history: dict[date, pd.DataFrame] = {}
-    strikes = np.arange(4800, 6010, 25)
     expiries = [7, 10, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365]
 
     for day_offset in range(n_days - 1, -1, -1):
@@ -1851,7 +2203,8 @@ def generate_demo_surfaces(cfg: VolSurfaceConfig | None = None, n_days: int = 6)
                     )
         df = pd.DataFrame(rows)
         history[asof] = clean_option_chain(df, cfg)
-        save_surface(df, cfg, asof=asof)
+        if save:
+            save_surface(df, cfg, asof=asof)
     return history
 
 
@@ -1910,10 +2263,57 @@ class VolSurfaceStudy:
         for d, df in self.surfaces.items():
             self._compute_surface(d, df)
 
-    def fetch_live(self) -> pd.DataFrame:
-        df = fetch_and_cache(self.cfg)
-        asof = pd.Timestamp(df["asof_date"].iloc[0]).date()
+    def ensure_history(
+        self,
+        min_sessions: int = 6,
+        *,
+        fetch_live: bool = True,
+        demo_backfill: bool = True,
+    ) -> None:
+        """Load cache, fetch live if empty, backfill with demo when history is too short."""
+        self.load_history(use_demo_if_empty=False)
+
+        if not self.surfaces and fetch_live:
+            try:
+                self.fetch_live()
+            except Exception as exc:
+                logger.warning("Live surface fetch failed for %s: %s", self.cfg.underlying, exc)
+            self.load_history(use_demo_if_empty=False)
+
+        if len(self.surfaces) < min_sessions and demo_backfill:
+            real = dict(self.surfaces)
+            demo = generate_demo_surfaces(
+                self.cfg,
+                n_days=self.cfg.lookback_days + 1,
+                save=False,
+            )
+            merged = trim_surfaces_to_sessions(
+                {**demo, **real},
+                self.cfg.lookback_days + 1,
+                business_days=True,
+            )
+            self._invalidate_plot_cache()
+            self.surfaces = merged
+            self.features.clear()
+            self.local_vols.clear()
+            self.grids.clear()
+            self.delta_grids.clear()
+            for d, df in self.surfaces.items():
+                self._compute_surface(d, df)
+
+        if not self.surfaces:
+            raise RuntimeError(f"No surface history available for {self.cfg.underlying}")
+
+    def fetch_live(self, *, save: bool = False) -> pd.DataFrame:
+        """Fetch today's option chain from Futu; by default no disk cache."""
         self._invalidate_plot_cache()
+        self.surfaces.clear()
+        self.features.clear()
+        self.local_vols.clear()
+        self.grids.clear()
+        self.delta_grids.clear()
+        df = fetch_and_cache(self.cfg, save=save)
+        asof = pd.Timestamp(df["asof_date"].iloc[0]).date()
         self._compute_surface(asof, df)
         return df
 

@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Index Quant Signal Hub</title>
+<script src="https://cdn.plot.ly/plotly-3.0.1.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+.header{padding:14px 24px;border-bottom:1px solid #1f2330;display:flex;align-items:center;background:#131722;gap:12px;z-index:10}
+.header h1{font-size:18px;font-weight:600;color:#e8eaed;letter-spacing:.3px}
+.header-tabs{display:flex;background:#1a1f2c;border-radius:6px;padding:2px;margin-left:24px}
+.tab-btn{background:transparent;border:none;color:#8f96a3;padding:6px 16px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;transition:all .15s}
+.tab-btn.active{background:#2a6cff;color:#fff}
+.badge{background:#1c2030;border-radius:6px;padding:4px 12px;font-size:13px;color:#9aa0a8;font-weight:500}
+.main-layout{display:flex;flex:1;overflow:hidden;padding:16px;gap:16px;height:calc(100vh - 54px)}
+.panel{background:#131722;border-radius:8px;border:1px solid #1f2330;overflow:hidden;display:flex;flex-direction:column}
+.ptitle{font-size:11px;font-weight:600;padding:10px 16px;border-bottom:1px solid #1f2330;color:#8f96a3;text-transform:uppercase;letter-spacing:.8px}
+.surface-panel{flex:1.4;display:flex;flex-direction:column;min-height: 400px;}
+.left-col{flex:1.2;display:flex;flex-direction:column;gap:16px;height:100%;overflow-y:auto;padding-right:4px;}
+.price-regime-panel{flex:1.0;display:flex;flex-direction:column;min-height: 380px;}
+.sidebar{flex:0.8;display:flex;flex-direction:column;gap:16px;overflow-y:auto;padding-right:4px}
+.controls{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid #1f2330;align-items:center}
+.controls label{font-size:11px;color:#8f96a3;font-weight:500}
+.rg{display:flex;gap:2px;background:#1a1f2c;border-radius:6px;padding:2px}
+.rb{padding:4px 12px;border-radius:4px;font-size:11px;cursor:pointer;border:none;background:transparent;color:#8f96a3;font-weight:600;transition:all .15s}
+.rb.active{background:#2a6cff;color:#fff}
+.dashboard-grid{display:grid;grid-template-columns:1fr 1.1fr;gap:12px;padding:16px;flex:1}
+.metric-card{background:#181d2e;border-radius:6px;border:1px solid #232a3f;padding:10px;display:flex;flex-direction:column;justify-content:center}
+.metric-card .label{font-size:9px;color:#8f96a3;text-transform:uppercase;font-weight:600;margin-bottom:3px}
+.metric-card .val{font-size:16px;font-weight:700;color:#ffffff}
+.gauge-wrap{position:relative;text-align:center;padding:8px;flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column}
+.gauge-svg{width:100%;max-width:240px;height:120px}
+.gv{font-size:22px;font-weight:700;margin-top:2px}
+.gl{font-size:12px;font-weight:600}
+.hmm-indicator{border-radius:6px;padding:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;transition:all .3s}
+.hmm-indicator.active{background:rgba(0,204,102,0.1);border:1.5px solid #00cc66}
+.hmm-indicator.inactive{background:rgba(231,76,60,0.1);border:1.5px solid #e74c3c}
+.summary-content{padding:12px 16px;font-size:12px;line-height:1.5;overflow-y:auto;flex:1}
+.metric-block{margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #1c2030}
+.metric-block:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.metric-block .metric-line{color:#e8eaed;font-weight:600;font-size:12px;margin-bottom:6px;line-height:1.4}
+.metric-block .insight-line{color:#9aa3b2;font-size:11.5px;line-height:1.55;font-weight:400}
+
+/* Styled Table for Iron Condor and moves */
+.condor-table{width:100%;border-collapse:collapse;font-size:11.5px;text-align:left;color:#b0b6c2}
+.condor-table th{background:#1a1f2c;color:#8f96a3;font-weight:600;padding:8px 12px;border-bottom:1.5px solid #1f2330;text-transform:uppercase;font-size:10px;letter-spacing:.5px}
+.condor-table td{padding:8px 12px;border-bottom:1px solid #1c2030;font-family:monospace}
+.condor-table tr:hover{background:rgba(42,108,255,0.05)}
+.condor-panel{flex:0 0 auto!important;min-height:0!important}
+.condor-panel .condor-scroll{overflow-x:auto;overflow-y:hidden}
+.refresh-btn{background:#2a6cff;border:none;color:#fff;padding:6px 14px;font-size:12px;font-weight:600;border-radius:6px;cursor:pointer;margin-left:12px;transition:opacity .15s}
+.refresh-btn:hover{opacity:.9}
+.refresh-btn:disabled{opacity:.45;cursor:not-allowed}
+.loading-overlay{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:40px;text-align:center;color:#8f96a3}
+.loading-overlay .title{color:#e8eaed;font-size:15px;font-weight:600;margin-bottom:8px}
+.loading-overlay .hint{font-size:12px;line-height:1.6;max-width:360px}
+.loading-overlay .elapsed{font-size:11px;color:#2a6cff;margin-top:12px;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Index Quant Signal Hub</h1>
+  <div class="header-tabs">
+    <button class="tab-btn active" onclick="switchIndex('SPX')">SPX (S&P 500)</button>
+    <button class="tab-btn" onclick="switchIndex('IXIC')">IXIC (NASDAQ)</button>
+    <button class="tab-btn" onclick="switchIndex('DJI')">DJI (Dow Jones)</button>
+  </div>
+  <span style="flex:1"></span>
+  <button class="refresh-btn" id="refreshBtn" onclick="refreshAll()">Refresh All</button>
+  <span id="loadedBadge" class="badge" style="margin-left:8px;display:none">--</span>
+  <span id="warnBadge" class="badge" style="margin-left:8px;display:none;background:#3d2a1a;color:#e67e22;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=""></span>
+  <span id="dateBadge" class="badge">--</span>
+  <span id="spotBadge" class="badge">--</span>
+</div>
+
+<div class="main-layout">
+  <div class="left-col">
+    <div class="panel surface-panel">
+      <div class="ptitle" id="surfaceTitle">Vol Surface - SPX</div>
+      <div class="controls">
+        <label>Mode:</label>
+        <div class="rg">
+          <button class="rb active" id="btnRawIV" onclick="setMode('iv')">Raw IV</button>
+          <button class="rb" id="btnSmoothIV" onclick="setMode('sv')">Smooth IV</button>
+          <button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button>
+        </div>
+      </div>
+      <div id="surfaceContainer" style="flex:1">
+        <div class="loading-overlay" id="initialLoader">
+          <div class="title">Loading live options data…</div>
+          <div class="hint">Fetching SPX, IXIC (QQQ), DJI (DIA) from Futu OpenD.<br>First load usually takes 1–3 minutes.</div>
+          <div class="elapsed" id="loadElapsed">0s</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Horizontal Sentiment Thermometer Bar placed directly under the Surface -->
+    <div class="panel" style="flex: 0 0 auto; padding: 12px 16px;">
+      <div class="ptitle" style="padding: 0 0 10px 0; border-bottom: none;">Quant Sentiment Compass (Horizontal Thermometer)</div>
+      <div id="horizontalCompassContainer" style="position: relative; min-height: 52px; margin-top: 4px;"></div>
+    </div>
+    
+    <div class="panel price-regime-panel">
+      <div class="ptitle" id="regimeTitle">Price & Volatility Regime Analysis - SPX</div>
+      <div id="regimeContainer" style="flex:1; min-height: 250px;"></div>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="panel" style="flex-shrink: 0;">
+      <div class="ptitle">Quant Regime & Sentiment Compass</div>
+      <div class="dashboard-grid" style="grid-template-columns: 1fr; gap: 10px; padding: 16px;">
+        <div style="display:flex; flex-direction:column; gap:10px">
+          <div class="hmm-indicator" id="hmmModeCard">
+            <div style="font-size:9px;text-transform:uppercase;font-weight:600;opacity:0.8">HMM Trading Signal</div>
+            <div style="font-size:16px;font-weight:700;margin:2px 0" id="hmmSignalVal">--</div>
+            <div style="font-size:9px;opacity:0.9" id="hmmProbVal">--</div>
+          </div>
+          <div class="metric-card">
+            <span class="label">Volatility Risk Premium (VRP)</span>
+            <span class="val" id="vraVal">--</span>
+          </div>
+          <div class="metric-card">
+            <span class="label">Term Structure Roll Spread</span>
+            <span class="val" id="tslVal">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Short Iron Condor Selector Panel (fixed 4-row height) -->
+    <div class="panel condor-panel">
+      <div class="ptitle">1-Sigma Vol Move Targets (Short Iron Condor Reference)</div>
+      <div class="condor-scroll">
+        <table class="condor-table">
+          <thead>
+            <tr>
+              <th>Horizon</th>
+              <th>Implied Move (IV)</th>
+              <th>Historical Move</th>
+              <th>Spot Range (Implied ±1σ)</th>
+            </tr>
+          </thead>
+          <tbody id="condorTableBody">
+            <tr><td colspan="4" style="text-align:center;color:#8f96a3">No data loaded</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Vol Shading Analysis RV vs IV (Third subplot, positioned below structure metrics / move targets) -->
+    <div class="panel price-regime-panel" style="flex: 1; min-height: 200px;">
+      <div class="ptitle">Volatility Historical Shading (RV vs IV)</div>
+      <div id="volHeatmapContainer" style="flex: 1; min-height: 200px;"></div>
+    </div>
+
+    <div class="panel" style="flex: 1; min-height: 200px;">
+      <div class="ptitle">Quantitative Structure Metrics</div>
+      <div class="summary-content" id="bulletsBox"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentIdx = 'SPX';
+let currentMode = 'iv';
+let dbData = {};
+let isFetching = false;
+let loadTimer = null;
+let loadStartedAt = 0;
+
+function startLoadTimer() {
+  loadStartedAt = Date.now();
+  const el = document.getElementById('loadElapsed');
+  if (loadTimer) clearInterval(loadTimer);
+  loadTimer = setInterval(() => {
+    if (el) el.textContent = Math.floor((Date.now() - loadStartedAt) / 1000) + 's elapsed';
+  }, 1000);
+}
+
+function stopLoadTimer() {
+  if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
+}
+
+function showLoadingOverlay(idx) {
+  const box = document.getElementById('surfaceContainer');
+  box.innerHTML = `
+    <div class="loading-overlay">
+      <div class="title">Loading ${idx}…</div>
+      <div class="hint">Live Futu fetch in progress for all indices.<br>Please wait — do not refresh the page.</div>
+      <div class="elapsed" id="loadElapsed">0s elapsed</div>
+    </div>`;
+  startLoadTimer();
+}
+
+function setRefreshState(loading) {
+  const btn = document.getElementById('refreshBtn');
+  btn.disabled = loading;
+  btn.textContent = loading ? 'Loading…' : 'Refresh All';
+}
+
+async function fetchServerData() {
+  if (isFetching) return;
+  isFetching = true;
+  setRefreshState(true);
+  showLoadingOverlay('all indices');
+  const loadedBadge = document.getElementById('loadedBadge');
+  loadedBadge.style.display = 'inline-block';
+  loadedBadge.textContent = 'Fetching live data…';
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 600000);
+    const res = await fetch('/api/signals?_=' + Date.now(), { cache: 'no-store', signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || ('HTTP ' + res.status));
+    }
+    const payload = await res.json();
+    if (payload.error && !payload.SPX && !payload.IXIC && !payload.DJI) {
+      throw new Error(payload.error);
+    }
+    dbData = payload;
+    loadedBadge.textContent = 'Loaded: ' + new Date().toLocaleTimeString();
+    renderAll();
+  } catch (e) {
+    console.error("Error drawing Quant Hub layouts:", e);
+    stopLoadTimer();
+    const msg = e.name === 'AbortError'
+      ? 'Request timed out after 10 minutes. Check Futu OpenD and try Refresh All.'
+      : ('Failed to load: ' + e.message);
+    document.getElementById('surfaceContainer').innerHTML =
+      `<div class="loading-overlay"><div class="title" style="color:#e74c3c">${msg}</div></div>`;
+    loadedBadge.textContent = 'Load failed';
+  } finally {
+    stopLoadTimer();
+    isFetching = false;
+    setRefreshState(false);
+  }
+}
+
+function refreshAll() {
+  fetchServerData();
+}
+
+function renderAll() {
+  stopLoadTimer();
+  const data = dbData[currentIdx];
+  if (!data) {
+    showLoadingOverlay(currentIdx);
+    return;
+  }
+  if (!data.exists) {
+    document.getElementById('surfaceContainer').innerHTML =
+      `<div style="padding:40px;text-align:center;color:#e74c3c;font-weight:600">${currentIdx}: ${data.error || 'pipeline failed'}</div>`;
+    return;
+  }
+  
+  // Date and Spot indicators
+  const warnBadge = document.getElementById('warnBadge');
+  if (data.warnings && data.warnings.length > 0) {
+    warnBadge.style.display = 'inline-block';
+    warnBadge.textContent = '⚠ ' + data.warnings.join(' | ');
+    warnBadge.title = data.warnings.join('
+');
+  } else {
+    warnBadge.style.display = 'none';
+    warnBadge.title = '';
+  }
+  document.getElementById('dateBadge').textContent = 'Date: ' + data.date;
+  document.getElementById('spotBadge').textContent = currentIdx + ': ' + data.spot.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1});
+  document.getElementById('surfaceTitle').textContent = "Vol Surface - " + currentIdx;
+
+  // 1. 3D Surface
+  let z;
+  let title;
+  let colorscale;
+  if (currentMode === 'iv') {
+    z = data.surface_z;
+    title = 'Raw Implied Vol (%)';
+    colorscale = 'Viridis';
+  } else if (currentMode === 'sv') {
+    z = data.surface_sv || data.surface_z;
+    title = 'Smooth Implied Vol (%)';
+    colorscale = 'Cividis';
+  } else {
+    z = data.surface_w;
+    title = 'Local Vol (%)';
+    colorscale = 'Magma';
+  }
+  const rng = currentMode === 'lv' ? [0, Math.max(...z.flat())] : undefined;
+  
+  const plotlyData = [{
+    type: 'surface',
+    x: data.surface_x,
+    y: data.surface_y,
+    z: z,
+    colorscale: colorscale,
+    hovertemplate: 'K/S (Moneyness): %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
+    colorbar: {title: title, titleside: 'right', x: 0.88, len: 0.7},
+    contours: {z: {show: true, usecolormap: true, highlightcolor: 'lime', project: {z: true}}},
+    cmin: rng && rng[0], cmax: rng && rng[1],
+  }];
+
+  const layout = {
+    margin: {l:0, r:0, t:0, b:0},
+    paper_bgcolor: '#131722',
+    plot_bgcolor: '#131722',
+    scene: {
+      xaxis: {title:'Moneyness (K/S)', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      yaxis: {title:'DTE', gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      zaxis: {title: title, gridcolor:'#222a3d', zerolinecolor:'#222a3d', tickfont:{color:'#8f96a3'}},
+      camera: {eye: {x:-1.5, y:-1.5, z:0.8}},
+      aspectmode: 'manual',
+      aspectratio: {x:1.0, y:1.2, z:0.6}
+    },
+    hoverlabel: {bgcolor:'#1c2030', font:{size:12}},
+    uirevision: 'surface',
+  };
+  Plotly.react('surfaceContainer', plotlyData, layout, {displayModeBar: false, responsive: true});
+
+  // 2. Speedometer Gauge (Disabled & replaced by horizontal thermometer under Surface)
+  const score = data.score;
+
+  // 7. Render Horizontal Sentiment Thermometer Bar under the 3D Surface
+  const compassPct = ((score + 100) / 200) * 100;
+  let scoreLabelColor = "#f1c40f";
+  if (score > 50) scoreLabelColor = "#27ae60";
+  else if (score > 15) scoreLabelColor = "#2ecc71";
+  else if (score < -50) scoreLabelColor = "#e74c3c";
+  else if (score < -15) scoreLabelColor = "#e67e22";
+
+  document.getElementById('horizontalCompassContainer').innerHTML = `
+    <div style="position:relative; width:100%; padding-top:20px;">
+      <div class="sentiment-thermometer-label-container" style="display: flex; justify-content: space-between; font-size: 10px; color: #8f96a3; margin-bottom: 6px; font-weight: 500;">
+        <span>Extremely Bearish (-100)</span>
+        <span>Neutral (0)</span>
+        <span>Extremely Bullish (100)</span>
+      </div>
+      <div class="sentiment-bar-track" style="position: relative; height: 16px; background: linear-gradient(90deg, #e74c3c 0%, #e67e22 25%, #f1c40f 50%, #2ecc71 75%, #27ae60 100%); border-radius: 8px; overflow: visible;">
+        <!-- Pointer marker -->
+        <div id="sentimentPointer" style="position: absolute; top: -3px; left: ${compassPct}%; width: 6px; height: 22px; background: #ffffff; border-radius: 3px; box-shadow: 0 0 10px rgba(255,255,255,0.8), 0 0 4px rgba(0,0,0,0.5); transform: translateX(-50%); transition: left 0.3s ease;"></div>
+        <!-- Tooltip box sliding with pointer -->
+        <div id="sentimentValueMarker" style="position: absolute; top: -34px; left: ${compassPct}%; background: #2a6cff; color: #ffffff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; transform: translateX(-50%); transition: left 0.3s ease; white-space: nowrap; box-shadow: 0 2px 6px rgba(0,0,0,0.3);">
+          Score: <span id="sentimentValueSpan">${score >= 0 ? '+' : ''}${score}</span>/100 (<span style="color: ${scoreLabelColor}">${getScoreLabel(score)}</span>)
+        </div>
+      </div>
+    </div>
+  `;
+
+  // 3. Side Quant Cards
+  // VRP
+  document.getElementById('vraVal').textContent = data.vrp.toFixed(1) + ' pts';
+  // Spread
+  document.getElementById('tslVal').textContent = data.tsl.toFixed(1) + ' vol pts';
+
+  // 4. HMM Mode Alert
+  const hmmCard = document.getElementById('hmmModeCard');
+  const signalVal = document.getElementById('hmmSignalVal');
+  const probVal = document.getElementById('hmmProbVal');
+  if (data.hmm_signal) {
+    hmmCard.className = "hmm-indicator active";
+    signalVal.textContent = "BUY / LONG";
+    signalVal.style.color = "#00cc66";
+  } else {
+    hmmCard.className = "hmm-indicator inactive";
+    signalVal.textContent = "NEUTRAL / CASH";
+    signalVal.style.color = "#e74c3c";
+  }
+  probVal.textContent = 'P(Calm today): ' + data.hmm_prob_today + '% | P(Calm tmr): ' + data.hmm_prob_tmr + '%';
+
+  // 5. Render Iron Condor Moves Reference Table 
+  const tableBody = document.getElementById('condorTableBody');
+  tableBody.innerHTML = '';
+  if (data.hmm_move_table && data.hmm_move_table.length > 0) {
+    data.hmm_move_table.slice(0, 4).forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="font-weight:bold;color:#fff">` + row.horizon + `</td>
+        <td style="color:#00cc66">` + row.implied + `</td>
+        <td style="color:#8f96a3">` + row.historical + `</td>
+        <td style="color:#2a6cff;font-weight:bold">` + row.spot_implied + `</td>
+      `;
+      tableBody.appendChild(tr);
+    });
+  } else {
+    tableBody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:#8f96a3">No move matrix compiled</td></tr>`;
+  }
+
+  // 6. Structure metrics with insights
+  const bulletsBox = document.getElementById('bulletsBox');
+  bulletsBox.innerHTML = '';
+  const blocks = data.structure_metrics || [];
+  if (blocks.length === 0) {
+    bulletsBox.innerHTML = '<div style="color:#8f96a3;font-size:12px">No structure metrics available.</div>';
+  } else {
+    blocks.forEach(block => {
+      const div = document.createElement('div');
+      div.className = 'metric-block';
+      div.innerHTML = `
+        <div class="metric-line">${block.metric}</div>
+        <div class="insight-line">${block.insight}</div>
+      `;
+      bulletsBox.appendChild(div);
+    });
+  }
+
+  // 7. Render Price & Volatility Regime Analysis Plot (Plotly Multi-axis with Shading)
+  if (data.hmm_dates && data.hmm_dates.length > 0) {
+    document.getElementById('regimeTitle').textContent = "Price & Volatility Regime Analysis - " + currentIdx;
+    
+    // Draw HMM Vol Shading blocks as layout shapes
+    let shapes = [];
+    let stateStart = null;
+    for (let i = 0; i < data.hmm_regimes.length; i++) {
+      if (data.hmm_regimes[i] === 'high_vol') {
+        if (stateStart === null) {
+          stateStart = data.hmm_dates[i];
+        }
+      } else {
+        if (stateStart !== null) {
+          shapes.push({
+            type: 'rect',
+            xref: 'x',
+            yref: 'paper',
+            x0: stateStart,
+            x1: data.hmm_dates[i - 1],
+            y0: 0,
+            y1: 1,
+            fillcolor: 'rgba(231,76,60,0.12)',
+            line: { width: 0 }
+          });
+          stateStart = null;
+        }
+      }
+    }
+    if (stateStart !== null) {
+      shapes.push({
+        type: 'rect',
+        xref: 'x',
+        yref: 'paper',
+        x0: stateStart,
+        x1: data.hmm_dates[data.hmm_dates.length - 1],
+        y0: 0,
+        y1: 1,
+        fillcolor: 'rgba(231,76,60,0.12)',
+        line: { width: 0 }
+      });
+    }
+
+    const regimePlotData = [
+      {
+        x: data.hmm_dates,
+        open: data.hmm_opens,
+        high: data.hmm_highs,
+        low: data.hmm_lows,
+        close: data.hmm_prices,
+        name: currentIdx + ' Price',
+        type: 'candlestick',
+        xaxis: 'x',
+        yaxis: 'y1',
+        increasing: { line: { color: '#2ecc71' } },
+        decreasing: { line: { color: '#e74c3c' } }
+      },
+      {
+        x: data.hmm_dates,
+        y: data.hmm_volumes,
+        name: 'Volume',
+        type: 'bar',
+        xaxis: 'x',
+        yaxis: 'y2',
+        marker: { color: 'rgba(42, 108, 255, 0.45)' }
+      }
+    ];
+
+    const regimeLayout = {
+      margin: { l: 50, r: 50, t: 25, b: 40 },
+      paper_bgcolor: '#131722',
+      plot_bgcolor: '#131722',
+      showlegend: false,
+      xaxis: {
+        gridcolor: '#1f2330',
+        tickfont: { color: '#8f96a3', size: 10 },
+        type: 'date',
+        rangeslider: { visible: false }
+      },
+      yaxis: {
+        title: 'Index price',
+        titlefont: { color: '#2a6cff', size: 11 },
+        tickfont: { color: '#8f96a3', size: 10 },
+        gridcolor: '#1f2330',
+        domain: [0.3, 1]
+      },
+      yaxis2: {
+        title: 'Volume',
+        titlefont: { color: '#8f96a3', size: 11 },
+        tickfont: { color: '#8f96a3', size: 9 },
+        gridcolor: '#1f2330',
+        domain: [0, 0.25],
+        anchor: 'x'
+      },
+      shapes: shapes,
+      hovermode: 'x'
+    };
+
+    Plotly.react('regimeContainer', regimePlotData, regimeLayout, { displayModeBar: false, responsive: true });
+  }
+
+  // 8. Render Volatility Shading Plot (RV vs IV)
+  if (data.hmm_dates && data.hmm_dates.length > 0) {
+    const iv22Idx = Math.max(0, data.hmm_iv.length - 1 - 22);
+    const iv22Ago = data.hmm_iv[iv22Idx];
+    const volPlotData = [
+      {
+        x: data.hmm_dates,
+        y: data.hmm_rv,
+        name: '22d Realized Vol %',
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#f1c40f', width: 1.5 }
+      },
+      {
+        x: data.hmm_dates,
+        y: data.hmm_iv,
+        name: 'ATM Implied Vol %',
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#ff7f0e', width: 1.5, dash: 'dot' }
+      }
+    ];
+    if (Number.isFinite(iv22Ago)) {
+      volPlotData.push({
+        x: [data.hmm_dates[0], data.hmm_dates[data.hmm_dates.length - 1]],
+        y: [iv22Ago, iv22Ago],
+        name: 'IV 22d ago',
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#e74c3c', width: 1.5, dash: 'dash' },
+        hovertemplate: 'IV 22d ago: %{y:.1f}%<extra></extra>'
+      });
+    }
+
+    const volLayout = {
+      margin: { l: 40, r: 20, t: 25, b: 40 },
+      paper_bgcolor: '#131722',
+      plot_bgcolor: '#131722',
+      showlegend: true,
+      legend: {
+        orientation: 'h',
+        x: 0,
+        y: 1.15,
+        font: { color: '#8f96a3', size: 10 }
+      },
+      xaxis: {
+        gridcolor: '#1f2330',
+        tickfont: { color: '#8f96a3', size: 10 },
+        type: 'date'
+      },
+      yaxis: {
+        title: 'Annualized Vol %',
+        titlefont: { color: '#8f96a3', size: 11 },
+        tickfont: { color: '#8f96a3', size: 10 },
+        gridcolor: '#1f2330'
+      },
+      hovermode: 'x'
+    };
+
+    Plotly.react('volHeatmapContainer', volPlotData, volLayout, { displayModeBar: false, responsive: true });
+  }
+}
+
+// Helpers
+function getScoreLabel(score) {
+  if (score > 50) return "Extremely Bullish";
+  if (score > 15) return "Slightly Bullish";
+  if (score > -15) return "Neutral";
+  if (score > -50) return "Slightly Bearish";
+  return "Extremely Bearish";
+}
+
+function switchIndex(idx) {
+  currentIdx = idx;
+  const btns = document.querySelectorAll('.header-tabs .tab-btn');
+  btns.forEach(b => {
+    if (b.textContent.includes(idx)) b.classList.add('active');
+    else b.classList.remove('active');
+  });
+  renderAll();
+}
+
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('btnRawIV').className = 'rb' + (mode === 'iv' ? ' active' : '');
+  document.getElementById('btnSmoothIV').className = 'rb' + (mode === 'sv' ? ' active' : '');
+  document.getElementById('btnLV').className = 'rb' + (mode === 'lv' ? ' active' : '');
+  renderAll();
+}
+
+// Fresh fetch on page open; tab switches reuse in-memory dbData until Refresh All
+fetchServerData();
+</script>
+</body>
+</html>
