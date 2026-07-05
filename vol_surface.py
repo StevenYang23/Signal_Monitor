@@ -639,6 +639,57 @@ def build_iv_grid(
     return grid_dte, grid_ks, iv_grid
 
 
+def smooth_iv_grid_quadratic(
+    df: pd.DataFrame,
+    grid_dte: np.ndarray,
+    grid_ks: np.ndarray,
+    iv_grid: np.ndarray,
+    *,
+    dte_window: int = 4,
+    iv_lo: float = 5.0,
+    iv_hi: float = 150.0,
+) -> np.ndarray:
+    """Per-DTE quadratic smile in log-moneyness; falls back to the raw IV slice."""
+    sub = df[np.isfinite(df["iv"]) & np.isfinite(df["dte"])].copy()
+    if "ks_ratio" not in sub.columns:
+        sub["ks_ratio"] = sub["option_strike_price"] / sub["spot"]
+    grouped = sub.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
+    dte_axis = grid_dte[:, 0]
+    ks_axis = grid_ks[0, :]
+    iv_smooth = np.zeros_like(iv_grid)
+    for i, dte in enumerate(dte_axis):
+        slice_df = grouped[np.abs(grouped["dte"] - dte) <= dte_window]
+        if len(slice_df) >= 3:
+            x_pts = np.log(slice_df["ks_ratio"].to_numpy())
+            y_pts = slice_df["iv"].to_numpy()
+            coeffs = np.polyfit(x_pts, y_pts, 2)
+            if coeffs[0] < 0:
+                coeffs = np.polyfit(x_pts, y_pts, 1)
+                coeffs = np.array([0.0, *coeffs])
+            for j, ks in enumerate(ks_axis):
+                iv_smooth[i, j] = np.clip(np.polyval(coeffs, np.log(ks)), iv_lo, iv_hi)
+        else:
+            iv_smooth[i, :] = iv_grid[i, :]
+    return iv_smooth
+
+
+def _sanitize_dupire_local_vol(
+    local_vol: np.ndarray,
+    iv_grid: np.ndarray,
+    denom: np.ndarray,
+    d2C_dK2: np.ndarray,
+) -> np.ndarray:
+    """Drop butterfly-violating / boundary nodes and cap vs local implied vol."""
+    bad = (denom <= 1e-4) | (d2C_dK2 <= 0) | ~np.isfinite(local_vol)
+    out = np.where(bad, np.nan, local_vol)
+    out[0, :] = np.nan
+    out[-1, :] = np.nan
+    out[:, 0] = np.nan
+    out[:, -1] = np.nan
+    cap = np.clip(iv_grid * 2.5, 40.0, 180.0)
+    return np.minimum(out, cap)
+
+
 def dupire_local_vol(
     spot: float,
     grid_dte: np.ndarray,
@@ -657,11 +708,13 @@ def dupire_local_vol(
     dC_dK = np.gradient(call_grid, k_axis, axis=1)
     d2C_dK2 = np.gradient(dC_dK, k_axis, axis=1)
 
+    # Dupire: σ² = 2(∂C/∂T + rK ∂C/∂K) / (K² ∂²C/∂K²)
+    numer = dC_dT + r * strike_grid * dC_dK
     denom = strike_grid**2 * d2C_dK2
     with np.errstate(divide="ignore", invalid="ignore"):
-        local_var = 2.0 * dC_dT / denom
+        local_var = 2.0 * numer / denom
     local_vol = np.sqrt(np.clip(local_var, 0.0, None)) * 100.0
-    return np.where(np.isfinite(local_vol), local_vol, np.nan)
+    return _sanitize_dupire_local_vol(local_vol, iv_grid, denom, d2C_dK2)
 
 
 def strike_from_delta(
@@ -780,16 +833,21 @@ def dupire_local_vol_delta(
 
     call_grid = bs_call_price(spot, strike_grid, t_years, r, iv_grid / 100.0)
     t_axis = t_years[:, 0]
-    k_axis = strike_grid[0, :]
     dC_dT = np.gradient(call_grid, t_axis, axis=0)
-    dC_dK = np.gradient(call_grid, k_axis, axis=1)
-    d2C_dK2 = np.gradient(dC_dK, k_axis, axis=1)
+    n_dte, n_delta = call_grid.shape
+    dC_dK = np.empty_like(call_grid)
+    d2C_dK2 = np.empty_like(call_grid)
+    for i in range(n_dte):
+        k_row = strike_grid[i, :]
+        dC_dK[i, :] = np.gradient(call_grid[i, :], k_row)
+        d2C_dK2[i, :] = np.gradient(dC_dK[i, :], k_row)
 
+    numer = dC_dT + r * strike_grid * dC_dK
     denom = strike_grid**2 * d2C_dK2
     with np.errstate(divide="ignore", invalid="ignore"):
-        local_var = 2.0 * dC_dT / denom
+        local_var = 2.0 * numer / denom
     local_vol = np.sqrt(np.clip(local_var, 0.0, None)) * 100.0
-    return np.where(np.isfinite(local_vol), local_vol, np.nan)
+    return _sanitize_dupire_local_vol(local_vol, iv_grid, denom, d2C_dK2)
 
 
 def _delta_band_stats(df: pd.DataFrame, delta_lo: float, delta_hi: float) -> dict[str, float]:
@@ -2663,32 +2721,12 @@ class VolSurfaceStudy:
         dte_grid = raw_dtes if max_dte is None else raw_dtes[raw_dtes <= max_dte]
 
         g_dte, g_ks, iv_g = build_iv_grid(df_today, dte_grid=dte_grid, max_dte=max_dte or int(raw_dtes.max()))
-        lv = dupire_local_vol(spot, g_dte, g_ks, iv_g, r=self.cfg.risk_free_rate)
 
         x_ks = g_ks[0, :]
         y_dte = g_dte[:, 0]
 
-        # Calculate a highly-regularized, beautiful quadratic SVI-style smooth Model fit surface
-        iv_g_smooth = np.zeros_like(iv_g)
-        if "ks_ratio" not in sub.columns:
-            sub["ks_ratio"] = sub["option_strike_price"] / sub["spot"]
-        grouped = sub.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
-
-        for i, dte in enumerate(dte_grid):
-            slice_df = grouped[np.abs(grouped["dte"] - dte) <= 4]
-            if len(slice_df) >= 3:
-                x_pts = np.log(slice_df["ks_ratio"].to_numpy())
-                y_pts = slice_df["iv"].to_numpy()
-                coeffs = np.polyfit(x_pts, y_pts, 2)
-                # Keep quadratic term positive for smile shape sanity
-                if coeffs[0] < 0:
-                    coeffs = np.polyfit(x_pts, y_pts, 1)
-                    coeffs = np.array([0.0] + list(coeffs))
-                for j, ks in enumerate(x_ks):
-                    val = np.polyval(coeffs, np.log(ks))
-                    iv_g_smooth[i, j] = np.clip(val, 5.0, 150.0)
-            else:
-                iv_g_smooth[i, :] = iv_g[i, :]
+        iv_g_smooth = smooth_iv_grid_quadratic(df_today, g_dte, g_ks, iv_g)
+        lv = dupire_local_vol(spot, g_dte, g_ks, iv_g_smooth, r=self.cfg.risk_free_rate)
 
         fig = go.Figure()
         

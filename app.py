@@ -38,6 +38,7 @@ from vol_surface import (  # noqa: E402
     deepseek_enhance_structure_insights,
     detect_term_hump,
     dupire_local_vol,
+    smooth_iv_grid_quadratic,
     fetch_anchor_iv_histories,
     fetch_spot_yfinance,
     fetch_vix_context,
@@ -144,33 +145,13 @@ class QuantEngine:
             spot = option_spot
 
         g_dte, g_ks, iv_g = build_iv_grid(df_today, max_dte=cfg.max_dte)
-        lv = dupire_local_vol(option_spot, g_dte, g_ks, iv_g, r=cfg.risk_free_rate)
 
         x_ks = [float(v) for v in g_ks[0, :]]
         y_dte = [float(v) for v in g_dte[:, 0]]
         iv_data = [[float(v) for v in row] for row in iv_g]
+        iv_g_smooth = smooth_iv_grid_quadratic(df_today, g_dte, g_ks, iv_g)
+        lv = dupire_local_vol(option_spot, g_dte, g_ks, iv_g_smooth, r=cfg.risk_free_rate)
         lv_data = [[float(v) for v in row] for row in lv]
-
-        sub_today = df_today[np.isfinite(df_today["iv"]) & np.isfinite(df_today["dte"])].copy()
-        if "ks_ratio" not in sub_today.columns:
-            sub_today["ks_ratio"] = sub_today["option_strike_price"] / sub_today["spot"]
-        grouped = sub_today.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
-
-        iv_g_smooth = np.zeros_like(iv_g)
-        for i, dte in enumerate(y_dte):
-            slice_df = grouped[np.abs(grouped["dte"] - dte) <= 4]
-            if len(slice_df) >= 3:
-                x_pts = np.log(slice_df["ks_ratio"].to_numpy())
-                y_pts = slice_df["iv"].to_numpy()
-                coeffs = np.polyfit(x_pts, y_pts, 2)
-                if coeffs[0] < 0:
-                    coeffs = np.polyfit(x_pts, y_pts, 1)
-                    coeffs = np.array([0.0, *coeffs])
-                for j, ks in enumerate(x_ks):
-                    val = np.polyval(coeffs, np.log(ks))
-                    iv_g_smooth[i, j] = np.clip(val, 5.0, 150.0)
-            else:
-                iv_g_smooth[i, :] = iv_g[i, :]
 
         sv_data = [[float(v) for v in row] for row in iv_g_smooth]
         result = _analyze_study(study, futu_up=futu_up)
