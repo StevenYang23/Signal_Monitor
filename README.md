@@ -104,27 +104,37 @@ By combining the principal scores with ATM skewness, term slope, and the base VI
 
 ### 3. HMM-based Volatility Regime Filtering / 隐马尔可夫机制概率分类
 
-Standard Trend Following strategies suffer severe whipsaw losses during sudden crisis periods. In [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb), we build a 2-State Gaussian Hidden Markov Model (HMM) fitted exclusively on rolling 2-year windows (504 trading days) using a single feature: **`lagged_VRP`** (Volatility Risk Premium). 
+Standard Trend Following strategies suffer severe whipsaw losses during sudden crisis periods. In [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb), we build a 2-State Gaussian Hidden Markov Model (HMM) fitted exclusively on rolling 2-year windows (504 trading days) using a single feature: **lagged VRP** (Volatility Risk Premium).
 
-$$RV22_t = \text{rolling std}(\log\text{ return}, 22) \times \sqrt{252} \times 100$$
-$$\text{lagged\_VRP}_t = IV_{t-22} - RV22_t$$
+$$
+\mathrm{RV22}_{t} = \mathrm{Std}(\log r,\, 22) \times \sqrt{252} \times 100
+$$
+
+$$
+\mathrm{laggedVRP}_{t} = IV_{t-22} - \mathrm{RV22}_{t}
+$$
 
 **Walk-Forward Out-Of-Sample Scoring:**
-1. Fit the Gaussian HMM on 504 historical days ending on $t-1$ (excluding today, $t$, to avoid leakages).
+1. Fit the Gaussian HMM on 504 historical days ending on day *t*−1 (excluding today, *t*, to avoid leakages).
 2. Determine state roles: the state with the lower mean of VRP is assigned as the **Calm (Low-Vol)** regime.
 3. Use `predict_proba` to evaluate the OOS probabilities of today being in a low-vol regime, and tomorrow transitioning to a low-vol regime.
-4. **Trading Rule:** Long the index tomorrow if and only if $P(\text{low\_vol}_t \ge 0.5)$ and $P(\text{low\_vol}_{t+1} \ge 0.5)$. Otherwise, go Flat.
+4. **Trading Rule:** Long the index tomorrow if and only if **P(low vol today) ≥ 0.5** and **P(low vol tomorrow) ≥ 0.5**. Otherwise, go Flat.
 
-在震荡走熊或危机降临期间，传统的持股或趋势跟踪策略往往面临严重的净值回撤。在 [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb) 中，本研究拟合了一个基于两状态高斯隐马尔可夫模型（HMM）的日频过滤策略。该模型仅使用一个衍生特征：**滞后波动率风险溢价（`lagged_VRP`）**：
+在震荡走熊或危机降临期间，传统的持股或趋势跟踪策略往往面临严重的净值回撤。在 [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb) 中，本研究拟合了一个基于两状态高斯隐马尔可夫模型（HMM）的日频过滤策略。该模型仅使用一个衍生特征：**滞后波动率风险溢价（lagged VRP）**：
 
-$$RV22_t = \text{rolling std}(\text{对数日收益率}, 22) \times \sqrt{252} \times 100$$
-$$\text{lagged\_VRP}_t = IV_{t-22} - RV22_t$$
+$$
+\mathrm{RV22}_{t} = \mathrm{Std}(\text{对数日收益率},\, 22) \times \sqrt{252} \times 100
+$$
+
+$$
+\mathrm{laggedVRP}_{t} = IV_{t-22} - \mathrm{RV22}_{t}
+$$
 
 **滚动跨期样本外概率打分：**
-1. 选取截至 $t-1$ 日以前的滚动 504 天（约 2 年）数据训练 HMM 模型（严格剥离当天 $t$ 的数据，绝无未来偏误）。
+1. 选取截至 *t*−1 日以前的滚动 504 天（约 2 年）数据训练 HMM 模型（严格剥离当天 *t* 的数据，绝无未来偏误）。
 2. 根据特征均值对隐含状态进行自动纠偏：均值较低的一方定义为 **低波平静状态**。
-3. 调取 `predict_proba` 求解今日处于该平静状态的样本外后验概率 $P(\text{low\_vol}_t)$ 以及一阶转移矩阵下明日仍处于该状态的预测概率 $P(\text{low\_vol}_{t+1})$。
-4. **交易规则：** 当且仅当两项低波概率判定皆 $\ge 0.5$ 时，明日做多标的（SPX, DJI, NDX）， 否则持币平仓。
+3. 调取 `predict_proba` 求解今日处于该平静状态的样本外后验概率 **P(low vol today)** 以及一阶转移矩阵下明日仍处于该状态的预测概率 **P(low vol tomorrow)**。
+4. **交易规则：** 当且仅当两项低波概率判定皆 ≥ 0.5 时，明日做多标的（SPX, DJI, NDX），否则持币平仓。
 
 #### Historical Outperformance & Regime Shading / 历史净值曲线与机制分类染色:
 * **Market Regimes vs Shaded Crucial Crash Zones (Red = Crisis, High-Vol/Choppy) / 机制状态划定（红色代表高波震荡）**:
