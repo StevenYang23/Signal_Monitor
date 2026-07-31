@@ -17,6 +17,7 @@ import matplotlib.axes
 import numpy as np
 import pandas as pd
 from scipy import interpolate
+from scipy.spatial import QhullError
 from scipy.stats import norm
 
 import futu as ft
@@ -28,10 +29,13 @@ DEFAULT_UNDERLYING = "US..SPX"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11111
 SNAPSHOT_BATCH = 200
-SNAPSHOT_PAUSE_SEC = 0.55
+SNAPSHOT_PAUSE_SEC = 2.0  # Increased to avoid Futu API rate limit (60 req / 30 sec) across multiple threads
 TRADING_DAYS = 252
 VIX_TICKER = "^VIX"
 SPX_TICKER = "^SPX"
+VVIX_TICKER = "^VVIX"
+SKEW_TICKER = "^SKEW"
+COR3M_TICKER = "^COR3M"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
 # Index underlyings: Futu index snapshots often require extra permissions yfinance.
@@ -620,14 +624,42 @@ def build_iv_grid(
     if len(sub) < 4:
         raise ValueError("Not enough OTM option quotes to build IV grid.")
 
-    points = sub[["dte", "ks_ratio", "iv"]].dropna().to_numpy()
+    grouped = sub.groupby(["dte", "ks_ratio"], as_index=False)["iv"].mean()
+    points = grouped[["dte", "ks_ratio", "iv"]].to_numpy()
+    unique_dtes = np.unique(points[:, 0])
+    unique_ks = np.unique(points[:, 1])
+
+    if unique_dtes.size == 1:
+        # A live chain can occasionally expose only one expiry. Preserve that
+        # observed smile instead of asking Qhull for an impossible 2-D surface.
+        order = np.argsort(points[:, 1])
+        smile_ks = points[order, 1]
+        smile_iv = points[order, 2]
+        if smile_ks.size < 2:
+            raise ValueError("Live option chain has fewer than two distinct strikes.")
+        grid_dte, grid_ks = np.meshgrid(unique_dtes, ks_grid, indexing="ij")
+        iv_grid = np.interp(ks_grid, smile_ks, smile_iv)
+        return grid_dte, grid_ks, np.clip(iv_grid[np.newaxis, :], 1.0, 200.0)
+
+    if unique_ks.size < 2:
+        raise ValueError("Live option chain has fewer than two distinct strike ratios.")
+
     grid_dte, grid_ks = np.meshgrid(dte_grid, ks_grid, indexing="ij")
-    iv_grid = interpolate.griddata(
-        points[:, :2],
-        points[:, 2],
-        (grid_dte, grid_ks),
-        method="linear",
-    )
+    try:
+        iv_grid = interpolate.griddata(
+            points[:, :2],
+            points[:, 2],
+            (grid_dte, grid_ks),
+            method="linear",
+        )
+    except QhullError:
+        logger.warning("Live IV points are degenerate; using nearest-neighbor interpolation.")
+        iv_grid = interpolate.griddata(
+            points[:, :2],
+            points[:, 2],
+            (grid_dte, grid_ks),
+            method="nearest",
+        )
     if np.isnan(iv_grid).any():
         iv_grid = interpolate.griddata(
             points[:, :2],
@@ -791,14 +823,40 @@ def build_iv_grid_delta(
     if len(sub) < 4:
         raise ValueError("Not enough OTM option quotes to build delta IV grid.")
 
-    points = sub[["dte", "delta", "iv"]].to_numpy()
+    grouped = sub.groupby(["dte", "delta"], as_index=False)["iv"].mean()
+    points = grouped[["dte", "delta", "iv"]].to_numpy()
+    unique_dtes = np.unique(points[:, 0])
+    unique_deltas = np.unique(points[:, 1])
+
+    if unique_dtes.size == 1:
+        order = np.argsort(points[:, 1])
+        observed_delta = points[order, 1]
+        observed_iv = points[order, 2]
+        if observed_delta.size < 2:
+            raise ValueError("Live option chain has fewer than two distinct deltas.")
+        grid_dte, grid_delta = np.meshgrid(unique_dtes, delta_grid, indexing="ij")
+        iv_grid = np.interp(delta_grid, observed_delta, observed_iv)
+        return grid_dte, grid_delta, np.clip(iv_grid[np.newaxis, :], 1.0, 200.0)
+
+    if unique_deltas.size < 2:
+        raise ValueError("Live option chain has fewer than two distinct deltas.")
+
     grid_dte, grid_delta = np.meshgrid(dte_grid, delta_grid, indexing="ij")
-    iv_grid = interpolate.griddata(
-        points[:, :2],
-        points[:, 2],
-        (grid_dte, grid_delta),
-        method="linear",
-    )
+    try:
+        iv_grid = interpolate.griddata(
+            points[:, :2],
+            points[:, 2],
+            (grid_dte, grid_delta),
+            method="linear",
+        )
+    except QhullError:
+        logger.warning("Live delta-IV points are degenerate; using nearest-neighbor interpolation.")
+        iv_grid = interpolate.griddata(
+            points[:, :2],
+            points[:, 2],
+            (grid_dte, grid_delta),
+            method="nearest",
+        )
     if np.isnan(iv_grid).any():
         iv_grid = interpolate.griddata(
             points[:, :2],
@@ -1393,9 +1451,16 @@ def _yf_close(ticker: str, period: str = "3mo") -> pd.Series:
     if yf is None:
         raise ImportError("yfinance is required")
     raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-    if raw.empty or "Close" not in raw:
+    if raw.empty:
         raise RuntimeError(f"No yfinance data for {ticker}")
-    close = raw["Close"]
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" not in raw.columns.get_level_values(0):
+            raise RuntimeError(f"No Close column for {ticker}")
+        close = raw["Close"]
+    elif "Close" not in raw.columns:
+        raise RuntimeError(f"No Close column for {ticker}")
+    else:
+        close = raw["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     return close.dropna().astype(float)
@@ -1431,6 +1496,278 @@ def fetch_vix_context(lookback_days: int = 5, trading_days: int = TRADING_DAYS) 
         "spx": float(latest["SPX"]),
         "history": df.tail(lookback_days + 1)[["VIX", "RV_22"]].reset_index(),
     }
+
+
+def _yf_latest_level(ticker: str, period: str = "3mo") -> dict[str, Any] | None:
+    """Latest close + short lookback deltas for an index ticker; None if unavailable.
+
+    Sparse Yahoo series (e.g. ^COR3M often has only the latest print) still return a level;
+    change/percentile fields become NaN when history is too short.
+    """
+    try:
+        series = _yf_close(ticker, period=period)
+    except Exception:
+        return None
+    if series is None or len(series) < 1:
+        return None
+    today = float(series.iloc[-1])
+    ago_1 = float(series.iloc[-2]) if len(series) >= 2 else np.nan
+    ago_5 = float(series.iloc[max(len(series) - 6, 0)]) if len(series) >= 2 else np.nan
+    change_1d = today - ago_1 if np.isfinite(ago_1) else np.nan
+    change_5d = today - ago_5 if np.isfinite(ago_5) else np.nan
+    return {
+        "ticker": ticker,
+        "asof": str(pd.Timestamp(series.index[-1]).date()),
+        "level": today,
+        "change_1d": change_1d,
+        "change_5d": change_5d,
+        "pctl_63d": float(series.tail(63).rank(pct=True).iloc[-1] * 100) if len(series) >= 10 else np.nan,
+    }
+
+
+def fetch_aux_vol_context(lookback_days: int = 5) -> dict[str, Any]:
+    """SPX-auxiliary vol indices: VVIX, SKEW, 3M implied correlation (^COR3M)."""
+    del lookback_days  # levels use a fixed 3mo window via _yf_latest_level
+    vvix = _yf_latest_level(VVIX_TICKER)
+    skew = _yf_latest_level(SKEW_TICKER)
+    cor3m = _yf_latest_level(COR3M_TICKER)
+    return {
+        "vvix": vvix,
+        "skew_index": skew,
+        "cor3m": cor3m,
+        "cor3m_ticker": COR3M_TICKER if cor3m is not None else None,
+        "meta": {
+            "vvix_ok": vvix is not None,
+            "skew_ok": skew is not None,
+            "cor3m_ok": cor3m is not None,
+        },
+    }
+
+
+def _mad_z(values: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Robust z-scores via median absolute deviation (scaled to ~N(0,1))."""
+    flat = values[np.isfinite(values)]
+    if flat.size < 5:
+        return np.zeros_like(values, dtype=float)
+    med = float(np.median(flat))
+    mad = float(np.median(np.abs(flat - med)))
+    scale = 1.4826 * mad if mad > eps else (float(np.std(flat)) or 1.0)
+    out = (values - med) / scale
+    out = np.where(np.isfinite(values), out, np.nan)
+    return out
+
+
+def detect_surface_anomalies(
+    grid_dte: np.ndarray,
+    grid_ks: np.ndarray,
+    iv_raw: np.ndarray,
+    iv_smooth: np.ndarray,
+    local_vol: np.ndarray | None,
+    today_features: dict[str, Any] | None = None,
+    cfg: VolSurfaceConfig | None = None,
+    *,
+    residual_z: float = 3.0,
+    neighbor_z: float = 3.0,
+    min_residual_pts: float = 2.0,
+    min_neighbor_pts: float = 2.5,
+    lv_iv_ratio: float = 2.0,
+    lv_abs_cap: float = 120.0,
+    extreme_skew: float = 8.0,
+    extreme_butterfly: float = 4.0,
+    max_points_per_kind: int = 12,
+) -> list[dict[str, Any]]:
+    """Flag anomalous nodes on a single-session IV / local-vol surface (no day-over-day).
+
+    Detection families
+    ------------------
+    1. smooth_residual — raw IV vs quadratic-smooth smile residual (MAD z)
+    2. local_spike — node vs 4-neighbor mean on the IV grid (MAD z)
+    3. lv_invalid / lv_explosion — Dupire holes or LV ≫ IV
+    4. structure — term hump, extreme skew / butterfly levels
+    """
+    cfg = cfg or VolSurfaceConfig()
+    today_features = today_features or {}
+    dte_axis = np.asarray(grid_dte[:, 0], dtype=float)
+    ks_axis = np.asarray(grid_ks[0, :], dtype=float)
+    iv_raw = np.asarray(iv_raw, dtype=float)
+    iv_smooth = np.asarray(iv_smooth, dtype=float)
+    n_dte, n_ks = iv_raw.shape
+    anomalies: list[dict[str, Any]] = []
+
+    def _push(kind: str, surface: str, i: int | None, j: int | None, *, value, baseline, score, detail: str) -> None:
+        ks = float(ks_axis[j]) if j is not None else np.nan
+        dte = float(dte_axis[i]) if i is not None else np.nan
+        anomalies.append(
+            {
+                "kind": kind,
+                "surface": surface,
+                "ks": None if not np.isfinite(ks) else round(ks, 4),
+                "dte": None if not np.isfinite(dte) else round(dte, 1),
+                "value": None if not np.isfinite(float(value)) else round(float(value), 2),
+                "baseline": None if baseline is None or not np.isfinite(float(baseline)) else round(float(baseline), 2),
+                "score": round(float(score), 2),
+                "detail": detail,
+            }
+        )
+
+    # --- 1) Smooth residuals ---
+    resid = iv_raw - iv_smooth
+    resid_z = _mad_z(resid)
+    resid_hits: list[tuple[float, int, int]] = []
+    for i in range(n_dte):
+        for j in range(n_ks):
+            r = resid[i, j]
+            z = resid_z[i, j]
+            if not np.isfinite(r) or not np.isfinite(z):
+                continue
+            if abs(z) >= residual_z and abs(r) >= min_residual_pts:
+                resid_hits.append((abs(z), i, j))
+    resid_hits.sort(reverse=True)
+    for z_abs, i, j in resid_hits[:max_points_per_kind]:
+        r = resid[i, j]
+        _push(
+            "smooth_residual",
+            "iv",
+            i,
+            j,
+            value=float(iv_raw[i, j]),
+            baseline=float(iv_smooth[i, j]),
+            score=z_abs,
+            detail=f"Raw IV residual {r:+.1f} vol pts vs smooth smile (z={resid_z[i, j]:+.1f})",
+        )
+
+    # --- 2) Local neighborhood spikes on raw IV ---
+    neigh_dev = np.full_like(iv_raw, np.nan)
+    for i in range(n_dte):
+        for j in range(n_ks):
+            if not np.isfinite(iv_raw[i, j]):
+                continue
+            vals = []
+            for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ii, jj = i + di, j + dj
+                if 0 <= ii < n_dte and 0 <= jj < n_ks and np.isfinite(iv_raw[ii, jj]):
+                    vals.append(float(iv_raw[ii, jj]))
+            if len(vals) < 2:
+                continue
+            neigh_dev[i, j] = float(iv_raw[i, j]) - float(np.mean(vals))
+    neigh_z = _mad_z(neigh_dev)
+    spike_hits: list[tuple[float, int, int]] = []
+    for i in range(n_dte):
+        for j in range(n_ks):
+            d = neigh_dev[i, j]
+            z = neigh_z[i, j]
+            if not np.isfinite(d) or not np.isfinite(z):
+                continue
+            if abs(z) >= neighbor_z and abs(d) >= min_neighbor_pts:
+                spike_hits.append((abs(z), i, j))
+    spike_hits.sort(reverse=True)
+    for z_abs, i, j in spike_hits[:max_points_per_kind]:
+        d = neigh_dev[i, j]
+        _push(
+            "local_spike",
+            "iv",
+            i,
+            j,
+            value=float(iv_raw[i, j]),
+            baseline=float(iv_raw[i, j] - d),
+            score=z_abs,
+            detail=f"IV spike {d:+.1f} vol pts vs 4-neighbor mean (z={neigh_z[i, j]:+.1f})",
+        )
+
+    # --- 3) Local vol pathologies ---
+    if local_vol is not None:
+        lv = np.asarray(local_vol, dtype=float)
+        invalid_hits: list[tuple[float, int, int]] = []
+        explosion_hits: list[tuple[float, int, int]] = []
+        for i in range(1, n_dte - 1):
+            for j in range(1, n_ks - 1):
+                iv = iv_smooth[i, j] if np.isfinite(iv_smooth[i, j]) else iv_raw[i, j]
+                lv_ij = lv[i, j]
+                if not np.isfinite(lv_ij):
+                    # Interior NaN after sanitize ⇒ butterfly / Dupire denom failure
+                    if np.isfinite(iv):
+                        invalid_hits.append((abs(iv), i, j))
+                    continue
+                if not np.isfinite(iv) or iv <= 1e-6:
+                    continue
+                ratio = lv_ij / iv
+                if ratio >= lv_iv_ratio or lv_ij >= lv_abs_cap:
+                    explosion_hits.append((max(ratio, lv_ij / 50.0), i, j))
+        invalid_hits.sort(reverse=True)
+        for score, i, j in invalid_hits[:max_points_per_kind]:
+            _push(
+                "lv_invalid",
+                "lv",
+                i,
+                j,
+                value=np.nan,
+                baseline=float(iv_smooth[i, j]) if np.isfinite(iv_smooth[i, j]) else float(iv_raw[i, j]),
+                score=score / 10.0,
+                detail="Local vol undefined (butterfly violation or Dupire denom ≤ 0)",
+            )
+        explosion_hits.sort(reverse=True)
+        for score, i, j in explosion_hits[:max_points_per_kind]:
+            iv = iv_smooth[i, j] if np.isfinite(iv_smooth[i, j]) else iv_raw[i, j]
+            _push(
+                "lv_explosion",
+                "lv",
+                i,
+                j,
+                value=float(lv[i, j]),
+                baseline=float(iv),
+                score=score,
+                detail=f"Local vol {lv[i, j]:.1f}% vs IV {iv:.1f}% (ratio {lv[i, j] / iv:.1f}x)",
+            )
+
+    # --- 4) Structure-level flags (whole curve / features) ---
+    hump = detect_term_hump(today_features, cfg)
+    if hump.get("event_hump"):
+        _push(
+            "term_hump",
+            "structure",
+            None,
+            None,
+            value=hump.get("hump_iv", np.nan),
+            baseline=hump.get("hump_baseline_iv", np.nan),
+            score=float(hump.get("hump_z", 0.0) or 0.0),
+            detail=f"ATM term hump near {hump.get('hump_dte')}d (z={hump.get('hump_z', 0):+.1f})",
+        )
+        # Attach DTE for plotting even though K/S is ATM ≈ 1.0
+        anomalies[-1]["dte"] = None if not np.isfinite(float(hump.get("hump_dte", np.nan))) else round(float(hump["hump_dte"]), 1)
+        anomalies[-1]["ks"] = 1.0
+
+    psk = float(today_features.get("skew_25d", np.nan))
+    if np.isfinite(psk) and abs(psk) >= extreme_skew:
+        _push(
+            "extreme_skew",
+            "structure",
+            None,
+            None,
+            value=psk,
+            baseline=extreme_skew,
+            score=abs(psk) / extreme_skew,
+            detail=f"25Δ put skew {psk:+.1f} vol pts (threshold ±{extreme_skew:.0f})",
+        )
+        anomalies[-1]["ks"] = 0.95
+        anomalies[-1]["dte"] = 30.0
+
+    bfly = float(today_features.get("butterfly_25d", np.nan))
+    if np.isfinite(bfly) and abs(bfly) >= extreme_butterfly:
+        _push(
+            "extreme_butterfly",
+            "structure",
+            None,
+            None,
+            value=bfly,
+            baseline=extreme_butterfly,
+            score=abs(bfly) / extreme_butterfly,
+            detail=f"25Δ butterfly {bfly:+.1f} vol pts (threshold ±{extreme_butterfly:.0f})",
+        )
+        anomalies[-1]["ks"] = 1.0
+        anomalies[-1]["dte"] = 30.0
+
+    anomalies.sort(key=lambda a: abs(float(a.get("score") or 0.0)), reverse=True)
+    return anomalies
 
 
 def load_deepseek_api_key(env_path: Path | None = None) -> str | None:
@@ -1661,9 +1998,6 @@ def fetch_anchor_iv_histories(
     try:
         for name, row in anchors.items():
             code = str(row["code"])
-            if code.startswith("DEMO."):
-                logger.warning("Skipping demo anchor %s", name)
-                continue
             time.sleep(SNAPSHOT_PAUSE_SEC)
             ret, vol = _futu_get_option_volatility(
                 ctx,
@@ -2185,87 +2519,6 @@ def build_commentary(
     return "\n".join(line for line in lines if line)
 
 
-def generate_demo_surfaces(
-    cfg: VolSurfaceConfig | None = None,
-    n_days: int = 6,
-    *,
-    save: bool = True,
-) -> dict[date, pd.DataFrame]:
-    """Synthetic surfaces for offline runs when OpenD/cache is unavailable."""
-    cfg = cfg or VolSurfaceConfig()
-    yf_spot = SPOT_YF_DEFAULT.get(cfg.underlying)
-    spot0 = 5400.0
-    if yf_spot:
-        try:
-            spot0, _ = fetch_spot_yfinance(yf_spot)
-        except Exception:
-            spot0 = {"US..NDX": 21000.0, "US.DIA": 420.0}.get(cfg.underlying, 5400.0)
-    strike_step = max(1.0, round(spot0 * 0.005, 2))
-    strikes = np.arange(
-        spot0 * cfg.moneyness_min,
-        spot0 * cfg.moneyness_max + strike_step,
-        strike_step,
-    )
-    history: dict[date, pd.DataFrame] = {}
-    expiries = [7, 10, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365]
-
-    for day_offset in range(n_days - 1, -1, -1):
-        asof = date.today() - timedelta(days=day_offset)
-        spot = spot0 * (1.0 - 0.002 * (n_days - 1 - day_offset))
-        rows: list[dict[str, Any]] = []
-        fear_ramp = (n_days - 1 - day_offset) * 0.15
-        hump_day = day_offset == 2
-
-        for dte in expiries:
-            t = dte / TRADING_DAYS
-            base_iv = 16.0 + 3.0 * np.sqrt(t) + fear_ramp
-            if hump_day and 8 <= dte <= 14:
-                base_iv += 6.0 * np.exp(-0.5 * ((dte - 10) / 1.5) ** 2)
-            for strike in strikes:
-                mny = spot / strike
-                log_m = np.log(strike / spot)
-                skew = 8.0 + fear_ramp * 2.0
-                smile = 2.5 * (log_m**2) * 100
-                wing = skew * max(-log_m, 0) * 100 - 0.5 * max(log_m, 0) * 100
-                iv = base_iv + smile + wing
-
-                for opt_type, delta_sign in (("CALL", 1), ("PUT", -1)):
-                    delta = delta_sign * norm.cdf((np.log(spot / strike) + 0.5 * (iv / 100) ** 2 * t) / ((iv / 100) * np.sqrt(t)))
-                    rows.append(
-                        {
-                            "asof_date": pd.Timestamp(asof),
-                            "code": f"DEMO.{strike}.{dte}.{opt_type[0]}",
-                            "option_type": opt_type,
-                            "strike_time": str(asof + timedelta(days=dte)),
-                            "option_strike_price": strike,
-                            "strike": strike,
-                            "expiry": pd.Timestamp(asof + timedelta(days=dte)),
-                            "dte": dte,
-                            "spot": spot,
-                            "moneyness": spot / strike if opt_type == "CALL" else strike / spot,
-                           "log_moneyness": log_m,
-                            "ks_ratio": strike / spot,
-                           "iv": iv,
-                            "option_implied_volatility": iv,
-                            "delta": delta,
-                            "option_delta": delta,
-                            "oi": 500,
-                            "option_open_interest": 500,
-                            "volume": 50,
-                            "bid": 1.0,
-                            "ask": 1.2,
-                            "bid_price": 1.0,
-                            "ask_price": 1.2,
-                            "option_valid": True,
-                        }
-                    )
-        df = pd.DataFrame(rows)
-        history[asof] = clean_option_chain(df, cfg)
-        if save:
-            save_surface(df, cfg, asof=asof)
-    return history
-
-
 class VolSurfaceStudy:
     """Fetch/cache IV surfaces and produce multi-day analysis."""
 
@@ -2294,23 +2547,18 @@ class VolSurfaceStudy:
             delta_grid = build_iv_grid_delta(df, max_dte=self.cfg.max_dte)
             self.delta_grids[d] = delta_grid
             g_dte, g_delta, iv_g = delta_grid
-            self.local_vols[d] = dupire_local_vol_delta(
-                spot, g_dte, g_delta, iv_g, r=self.cfg.risk_free_rate
-            )
+            if g_dte.shape[0] >= 2:
+                self.local_vols[d] = dupire_local_vol_delta(
+                    spot, g_dte, g_delta, iv_g, r=self.cfg.risk_free_rate
+                )
         except ValueError as exc:
             logger.warning("Delta/local vol skipped for %s: %s", d, exc)
-            if d in self.grids:
+            if d in self.grids and self.grids[d][0].shape[0] >= 2:
                 self.local_vols[d] = dupire_local_vol(spot, *self.grids[d], r=self.cfg.risk_free_rate)
 
-    def load_history(self, use_demo_if_empty: bool = False) -> None:
+    def load_history(self) -> None:
         self._invalidate_plot_cache()
         self.surfaces = load_surface_history(self.cfg, self.cfg.lookback_days)
-        if (not self.surfaces or len(self.surfaces) < 6) and use_demo_if_empty:
-            warnings.warn(
-                "No cached surfaces or too few sessions - loading demo SPX surfaces.",
-                stacklevel=2,
-            )
-            self.surfaces = generate_demo_surfaces(self.cfg, n_days=self.cfg.lookback_days + 1)
         self.surfaces = trim_surfaces_to_sessions(
             self.surfaces, self.cfg.lookback_days + 1, business_days=True
         )
@@ -2326,32 +2574,17 @@ class VolSurfaceStudy:
         min_sessions: int = 6,
         *,
         fetch_live: bool = True,
-        demo_backfill: bool = True,
     ) -> None:
-        """Load cache, fetch live if empty, backfill with demo when history is too short."""
-        self.load_history(use_demo_if_empty=False)
+        """Load real history and always add a freshly fetched live surface."""
+        self.load_history()
 
-        if not self.surfaces and fetch_live:
-            try:
-                self.fetch_live()
-            except Exception as exc:
-                logger.warning("Live surface fetch failed for %s: %s", self.cfg.underlying, exc)
-            self.load_history(use_demo_if_empty=False)
-
-        if len(self.surfaces) < min_sessions and demo_backfill:
-            real = dict(self.surfaces)
-            demo = generate_demo_surfaces(
-                self.cfg,
-                n_days=self.cfg.lookback_days + 1,
-                save=False,
+        if fetch_live:
+            live_df = fetch_and_cache(self.cfg, save=True)
+            live_date = pd.Timestamp(live_df["asof_date"].iloc[0]).date()
+            self.surfaces[live_date] = live_df
+            self.surfaces = trim_surfaces_to_sessions(
+                self.surfaces, self.cfg.lookback_days + 1, business_days=True
             )
-            merged = trim_surfaces_to_sessions(
-                {**demo, **real},
-                self.cfg.lookback_days + 1,
-                business_days=True,
-            )
-            self._invalidate_plot_cache()
-            self.surfaces = merged
             self.features.clear()
             self.local_vols.clear()
             self.grids.clear()
@@ -2360,7 +2593,13 @@ class VolSurfaceStudy:
                 self._compute_surface(d, df)
 
         if not self.surfaces:
-            raise RuntimeError(f"No surface history available for {self.cfg.underlying}")
+            raise RuntimeError(f"No live surface available for {self.cfg.underlying}")
+        if len(self.surfaces) < min_sessions:
+            logger.warning(
+                "Only %d real surface session(s) available for %s; history-based metrics may be limited.",
+                len(self.surfaces),
+                self.cfg.underlying,
+            )
 
     def fetch_live(self, *, save: bool = False) -> pd.DataFrame:
         """Fetch today's option chain from Futu; by default no disk cache."""

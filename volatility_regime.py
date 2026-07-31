@@ -655,9 +655,19 @@ class HMMVolatilityRegime:
                 quotes[column] = latest
 
         if quotes:
-            target_date = max(quote_date for quote_date, _ in quotes.values())
-            for column, (_, quote_price) in quotes.items():
-                updated.loc[target_date, column] = quote_price
+            # Anchor on the underlying's quote date. Vol indices (e.g. ^VIX) can return
+            # intraday bars stamped "today" while ^SPX/ETF daily close is still on the
+            # prior session — using max(dates) would fabricate an extra non-trading day.
+            underly_key = "SPX"
+            if underly_key in quotes:
+                target_date, underly_price = quotes[underly_key]
+                updated.loc[target_date, underly_key] = underly_price
+                if "VIX" in quotes:
+                    _, vol_price = quotes["VIX"]
+                    updated.loc[target_date, "VIX"] = vol_price
+            else:
+                for column, (quote_date, quote_price) in quotes.items():
+                    updated.loc[quote_date, column] = quote_price
 
         self.prices = updated.dropna(subset=["SPX", "VIX"]).sort_index()
         return self.prices

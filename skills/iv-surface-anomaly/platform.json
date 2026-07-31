@@ -1,0 +1,10 @@
+{
+  "id": "iv-surface-anomaly",
+  "name": "IV / Local-Vol Surface Anomaly Hunt",
+  "version": "1.0.0",
+  "description": "Find anomalous nodes on a single-session SPX IV and Dupire local-vol surface; cross-check with VVIX, SKEW, and 3M implied correlation. No day-over-day surface deltas.",
+  "author": "user",
+  "type": "skill",
+  "entry": "SKILL.md",
+  "tags": ["volatility", "options", "iv-surface", "local-vol", "anomaly", "spx"]
+}
