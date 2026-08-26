@@ -13,9 +13,6 @@ The live dashboard in `app.py` brings together:
 - LLM-generated interpretation layer for structure metrics
 
 ![Full Dashboard](demo/Full_dashboard.png)
-![Signal Page](demo/signal_page.png)
-![Compass](demo/Compass.png)
-![SPX Signal Snapshot](demo/SPX_signal.png)
 
 ## 2) Volatility Surface (SVI + Dupire)
 
@@ -37,8 +34,6 @@ $$
 
 This is useful because SVI stabilizes sparse option quotes into a smooth smile, while Dupire translates the surface into state-dependent instantaneous volatility for risk and scenario work.
 
-![IV Surface](demo/IV_surface.png)
-![Vol Surface](demo/vol_surface.png)
 ![SVI Vol](demo/svi_vol.png)
 ![Dupire Local Vol](demo/dupire_local_vol.png)
 
