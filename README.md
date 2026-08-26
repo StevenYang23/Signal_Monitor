@@ -72,6 +72,11 @@ $$
 
 SSR helps quantify smile dynamics under spot moves (sticky-delta vs sticky-strike), improving hedge assumptions and separating volatility repricing from directional spot stress.
 
+Practical interpretation:
+- **How IV moves when spot moves:** `SSR ≈ 1` is closer to sticky-strike, `SSR ≈ 0` is closer to sticky-delta, and `SSR > 1` often indicates a more aggressive smile response to spot shocks.
+- **Whether repricing is normal or stressed:** rising SSR usually means downside moves are triggering stronger ATM IV repricing, while falling SSR suggests a softer vol response.
+- **Hedging and positioning implications:** higher SSR often means delta/vega hedges can drift faster under spot moves; lower SSR usually implies more stable smile dynamics and less jumpy hedge behavior.
+
 ![Realized SSR](demo/Realized_skew_stickiness_ratio.png)
 ![Implied SSR](demo/Implied_skew_stickiness_ratio.png)
 
