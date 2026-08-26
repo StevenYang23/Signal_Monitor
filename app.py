@@ -340,6 +340,11 @@ class QuantEngine:
         # Calculate SSR
         realized_ssr = np.nan
         implied_ssr_val = np.nan
+        ssr_history_dates = []
+        ssr_history_values = []
+        ssr_implied_dte = []
+        ssr_implied_values = []
+        ssr_implied_power = []
         try:
             es, _ = fetch_es_futures(lookback_days=90)
             fut = es["close"]
@@ -349,11 +354,20 @@ class QuantEngine:
                 slope = atmf_skew_slope(aiv, psk, dte=30)
                 ssr_df = rolling_ssr(fut, iv_series, slope, window=10)
                 if not ssr_df.empty:
-                    realized_ssr = float(ssr_df.dropna(subset=["ssr"]).iloc[-1].ssr)
+                    valid_ssr = ssr_df.dropna(subset=["ssr"])
+                    if not valid_ssr.empty:
+                        realized_ssr = float(valid_ssr.iloc[-1].ssr)
+                        ssr_history_dates = [d.strftime("%Y-%m-%d") for d in valid_ssr.index]
+                        ssr_history_values = [float(v) for v in valid_ssr["ssr"]]
             
             imp = implied_ssr(x_ks, y_dte, sv_data, min_dte=14.0)
             if not imp.empty and not imp["ssr"].dropna().empty:
                 implied_ssr_val = float(np.interp(30.0, imp["dte"], imp["ssr"]))
+                valid_imp = imp.dropna(subset=["ssr"])
+                ssr_implied_dte = [float(v) for v in valid_imp["dte"]]
+                ssr_implied_values = [float(v) for v in valid_imp["ssr"]]
+                if "ssr_power" in valid_imp.columns:
+                    ssr_implied_power = [float(v) for v in valid_imp["ssr_power"]]
         except Exception as ssr_exc:
             print(f"[pipeline] {short_name} SSR: {ssr_exc}", flush=True)
 
@@ -395,6 +409,13 @@ class QuantEngine:
             "bfly": bfly,
             "d_bfly": d_bfly,
             "vrp": vrp_val,
+            "realized_ssr": realized_ssr,
+            "implied_ssr": implied_ssr_val,
+            "ssr_history_dates": ssr_history_dates,
+            "ssr_history_values": ssr_history_values,
+            "ssr_implied_dte": ssr_implied_dte,
+            "ssr_implied_values": ssr_implied_values,
+            "ssr_implied_power": ssr_implied_power,
             "structure_metrics": structure_metrics,
             "gex": gex_payload,
             "surface_x": x_ks,
@@ -633,12 +654,11 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
           <button class="rb active" id="btnRawIV" onclick="setMode('iv')">Raw IV</button>
           <button class="rb" id="btnSmoothIV" onclick="setMode('sv')">Smooth IV</button>
           <button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button>
-          <button class="rb" id="btnAnomaly" onclick="setMode('anomaly')">Anomaly</button>
         </div>
       </div>
-      <div class="plot-wrap" style="background:transparent;flex:1;min-height:340px;display:flex;flex-direction:column;">
+      <div class="plot-wrap" style="background:transparent;flex:1;min-height:340px;display:flex;flex-direction:row;">
         <div id="surfacePlot" class="plot-target" style="flex:1;"></div>
-        <div id="surfaceAnomalyBox" class="summary-content" style="display:none; flex:1;"></div>
+        <div id="surfaceAnomalyBox" class="summary-content" style="flex:1; border-left:1px solid #1f2330;"></div>
         <div class="loading-overlay hidden" id="surfaceLoader">
           <div class="title">Loading SPX…</div>
           <div class="hint">Fetching options via Futu OpenD (127.0.0.1:11111).<br>First load may take 1–3 minutes.</div>
@@ -648,22 +668,27 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
     </div>
 
     <div class="panel" style="flex:0 0 auto;min-height:440px">
-      <div class="ptitle" id="gexTitle">Dealer Gamma Exposure (GEX)</div>
+      <div class="ptitle" id="gexTitle">Dealer Gamma Exposure (GEX) & Skew Stickiness Ratio (SSR)</div>
       <div class="controls" id="gexTtmControls">
         <label>TTM:</label>
         <div class="rg" id="gexBucketBtns"></div>
         <span style="font-size:10px;color:#8f96a3;margin-left:8px" id="gexHint">TTM 0–5 BD. OI is T-1. Calls + / puts −.</span>
       </div>
-      <div class="gex-stats" style="grid-template-columns:repeat(6,1fr);">
+      <div class="gex-stats" style="grid-template-columns:repeat(4,1fr);">
         <div class="gex-stat"><div class="glabel">Net GEX</div><div class="gval" id="gexNetVal">--</div></div>
         <div class="gex-stat"><div class="glabel">Gamma Flip</div><div class="gval" id="gexFlipVal">--</div></div>
         <div class="gex-stat"><div class="glabel">Call Wall</div><div class="gval" id="gexCallWallVal">--</div></div>
         <div class="gex-stat"><div class="glabel">Put Wall</div><div class="gval" id="gexPutWallVal">--</div></div>
-        <div class="gex-stat"><div class="glabel">Realized SSR</div><div class="gval" id="realizedSsrVal">--</div></div>
-        <div class="gex-stat"><div class="glabel">Implied SSR</div><div class="gval" id="impliedSsrVal">--</div></div>
       </div>
       <div class="plot-wrap" style="min-height:340px">
         <div id="gexPlot" class="plot-target" style="min-height:340px"></div>
+      </div>
+    </div>
+
+    <div class="panel" style="flex:0 0 auto;min-height:360px">
+      <div class="plot-wrap" style="min-height:340px; display:flex; flex-direction:row; gap:8px;">
+        <div id="ssrImpliedPlot" class="plot-target" style="flex:1; min-height:340px;"></div>
+        <div id="ssrRealizedPlot" class="plot-target" style="flex:1; min-height:340px;"></div>
       </div>
     </div>
 
@@ -754,7 +779,7 @@ function showBlankState(){
   $('surfaceTitle').querySelector('span').textContent = 'Vol Surface - ' + currentIdx;
   $('regimeTitle').textContent = 'HMM Signal Window - ' + currentIdx;
   if (typeof Plotly !== 'undefined') {
-    ['surfacePlot','regimePlot','volPlot','gexPlot'].forEach(id => {
+    ['surfacePlot','regimePlot','volPlot','gexPlot','ssrImpliedPlot','ssrRealizedPlot'].forEach(id => {
       const el = $(id);
       if (el) Plotly.purge(el);
     });
@@ -763,8 +788,6 @@ function showBlankState(){
   $('gexFlipVal').textContent = '--';
   $('gexCallWallVal').textContent = '--';
   $('gexPutWallVal').textContent = '--';
-  $('realizedSsrVal').textContent = '--';
-  $('impliedSsrVal').textContent = '--';
   $('gexBucketBtns').innerHTML = '';
   $('vraVal').textContent = '--';
   $('tslVal').textContent = '--';
@@ -903,8 +926,7 @@ function renderGexPanel(data){
   $('gexFlipVal').textContent = fmtGexStrike(b.flip);
   $('gexCallWallVal').textContent = fmtGexStrike(b.call_wall);
   $('gexPutWallVal').textContent = fmtGexStrike(b.put_wall);
-  $('realizedSsrVal').textContent = Number.isFinite(data.realized_ssr) ? Number(data.realized_ssr).toFixed(2) : '--';
-  $('impliedSsrVal').textContent = Number.isFinite(data.implied_ssr) ? Number(data.implied_ssr).toFixed(2) : '--';
+  
   let hint = (b.n_contracts || 0) + ' contracts';
   if (b.expiry) hint += ' · expiry ' + b.expiry;
   if (b.ttm_actual != null) hint += ' · ' + b.ttm_actual + ' BD';
@@ -1145,8 +1167,6 @@ function drawOneSurface(elId, data, idx, z, title, colorscale, withMarks, zRange
 }
 
 function renderSurfacePanel(data, idx) {
-  if (currentMode === 'anomaly') return;
-
   let z, title, colorscale, zRange;
   if (currentMode === 'iv') {
     z = data.surface_z; title = 'Raw Implied Vol (%)'; colorscale = 'Viridis';
@@ -1248,6 +1268,86 @@ function renderVolPanel(data) {
   }, { displayModeBar: false, responsive: true });
 }
 
+function renderSsrPanel(data) {
+  const ivLabel = data.hmm_iv_label || 'VIX';
+  
+  // Realized SSR Plot
+  if (data.ssr_history_dates && data.ssr_history_dates.length > 0) {
+    const tracesRealized = [{
+      x: data.ssr_history_dates,
+      y: data.ssr_history_values,
+      type: 'scatter', mode: 'lines', name: '10d SSR',
+      line: { color: '#5dade2', width: 2 }
+    }];
+    Plotly.react('ssrRealizedPlot', tracesRealized, {
+      title: { text: `Realized skew stickiness — SPX<br><sup>1 sticky-strike · 0 sticky-delta · F=ES · σ=${ivLabel}</sup>`, font: { color: '#e8eaed', size: 14 } },
+      height: 340,
+      margin: { l: 48, r: 12, t: 48, b: 32 },
+      paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+      hovermode: 'x unified',
+      showlegend: false,
+      xaxis: { gridcolor: '#1f2330', type: 'date', tickfont: { color: '#8f96a3', size: 9 }, tickformat: '%b %d\n%Y' },
+      yaxis: { title: { text: 'SSR', font: { color: '#8f96a3', size: 10 } }, gridcolor: '#1f2330', tickfont: { color: '#8f96a3', size: 9 }, zeroline: false },
+      shapes: [
+        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 0, y1: 0, line: { color: '#8f96a3', width: 1, dash: 'dot' } },
+        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 1, y1: 1, line: { color: '#27ae60', width: 1, dash: 'dash' } }
+      ],
+      annotations: [
+        { x: 1, y: 1, xref: 'paper', yref: 'y', text: 'sticky-strike', showarrow: false, font: { color: '#27ae60', size: 10 }, xanchor: 'right', yshift: 8 },
+        { x: 1, y: 0, xref: 'paper', yref: 'y', text: 'sticky-delta', showarrow: false, font: { color: '#8f96a3', size: 10 }, xanchor: 'right', yshift: 8 }
+      ]
+    }, { displayModeBar: false, responsive: true });
+  } else {
+    $('ssrRealizedPlot').innerHTML = '<div class="blank-hint">No Realized SSR data.</div>';
+  }
+
+  // Implied SSR Plot
+  if (data.ssr_implied_dte && data.ssr_implied_dte.length > 0) {
+    const tracesImplied = [{
+      x: data.ssr_implied_dte,
+      y: data.ssr_implied_values,
+      type: 'scatter', mode: 'lines+markers', name: 'implied SSR',
+      line: { color: '#e74c3c', width: 2 }, marker: { size: 5 }
+    }];
+    
+    let r_star_text = '';
+    if (data.ssr_implied_power && data.ssr_implied_power.length > 0) {
+      const r_star = data.ssr_implied_power[0];
+      r_star_text = `power-law ${r_star.toFixed(2)}`;
+      tracesImplied.push({
+        x: data.ssr_implied_dte,
+        y: data.ssr_implied_power,
+        type: 'scatter', mode: 'lines+markers', name: r_star_text,
+        line: { color: '#e67e22', width: 1, dash: 'dash' }, marker: { size: 4 }
+      });
+    }
+    
+    Plotly.react('ssrImpliedPlot', tracesImplied, {
+      title: { text: 'Implied skew stickiness — SPX<br><sup>Bergomi 1 sticky-strike · 2 short LV · SVI smile, no history</sup>', font: { color: '#e8eaed', size: 14 } },
+      height: 340,
+      margin: { l: 48, r: 12, t: 48, b: 32 },
+      paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+      hovermode: 'x unified',
+      showlegend: true,
+      legend: { orientation: 'h', y: 1.15, x: 0, font: { size: 9, color: '#8f96a3' }, bgcolor: 'rgba(0,0,0,0)' },
+      xaxis: { title: { text: 'DTE', font: { color: '#8f96a3', size: 10 } }, gridcolor: '#1f2330', tickfont: { color: '#8f96a3', size: 9 } },
+      yaxis: { title: { text: 'SSR', font: { color: '#8f96a3', size: 10 } }, gridcolor: '#1f2330', tickfont: { color: '#8f96a3', size: 9 }, zeroline: false },
+      shapes: [
+        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 0, y1: 0, line: { color: '#8f96a3', width: 1, dash: 'dot' } },
+        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 1, y1: 1, line: { color: '#8f96a3', width: 1, dash: 'dash' } },
+        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 2, y1: 2, line: { color: '#27ae60', width: 1, dash: 'dash' } }
+      ],
+      annotations: [
+        { x: 1, y: 1, xref: 'paper', yref: 'y', text: 'sticky-strike', showarrow: false, font: { color: '#8f96a3', size: 10 }, xanchor: 'right', yshift: 8 },
+        { x: 1, y: 0, xref: 'paper', yref: 'y', text: 'sticky-delta', showarrow: false, font: { color: '#8f96a3', size: 10 }, xanchor: 'right', yshift: 8 },
+        { x: 1, y: 2, xref: 'paper', yref: 'y', text: 'short LV', showarrow: false, font: { color: '#27ae60', size: 10 }, xanchor: 'right', yshift: 8 }
+      ]
+    }, { displayModeBar: false, responsive: true });
+  } else {
+    $('ssrImpliedPlot').innerHTML = '<div class="blank-hint">No Implied SSR data.</div>';
+  }
+}
+
 function renderAll(){
   const data = cache[currentIdx];
   if (!data || !data.exists) {
@@ -1273,6 +1373,7 @@ function renderAll(){
   $('surfaceTitle').querySelector('span').textContent = 'Vol Surface - ' + currentIdx;
   renderSurfacePanel(data, currentIdx);
   renderGexPanel(data);
+  renderSsrPanel(data);
 
   $('vraVal').textContent = Number(data.vrp).toFixed(1) + ' pts';
   $('tslVal').textContent = Number(data.tsl).toFixed(1) + ' vol pts';
@@ -1343,15 +1444,6 @@ function setMode(mode){
   $('btnRawIV').className = 'rb' + (mode === 'iv' ? ' active' : '');
   $('btnSmoothIV').className = 'rb' + (mode === 'sv' ? ' active' : '');
   $('btnLV').className = 'rb' + (mode === 'lv' ? ' active' : '');
-  $('btnAnomaly').className = 'rb' + (mode === 'anomaly' ? ' active' : '');
-  
-  if (mode === 'anomaly') {
-    $('surfacePlot').style.display = 'none';
-    $('surfaceAnomalyBox').style.display = 'block';
-  } else {
-    $('surfacePlot').style.display = 'block';
-    $('surfaceAnomalyBox').style.display = 'none';
-  }
   renderAll();
 }
 
