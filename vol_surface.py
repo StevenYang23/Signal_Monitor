@@ -17,6 +17,7 @@ import matplotlib.axes
 import numpy as np
 import pandas as pd
 from scipy import interpolate
+from scipy.optimize import least_squares
 from scipy.spatial import QhullError
 from scipy.stats import norm
 
@@ -61,6 +62,10 @@ class VolSurfaceConfig:
     min_dte: int = 1
     moneyness_min: float = 0.88
     moneyness_max: float = 1.12
+    # Wider snapshot window for GEX (0DTE + wings). Surface still uses min_dte/moneyness_*.
+    fetch_min_dte: int = 0
+    fetch_moneyness_min: float = 0.80
+    fetch_moneyness_max: float = 1.20
     min_open_interest: int = 1
     min_iv: float = 1.0
     max_iv: float = 200.0
@@ -186,6 +191,17 @@ def _standardize_chain(raw: pd.DataFrame, spot: float, asof: date) -> pd.DataFra
     df["log_moneyness"] = np.log(df["option_strike_price"] / df["spot"])
     df["iv"] = pd.to_numeric(df["option_implied_volatility"], errors="coerce")
     df["delta"] = pd.to_numeric(df["option_delta"], errors="coerce")
+    df["gamma"] = pd.to_numeric(df["option_gamma"], errors="coerce") if "option_gamma" in df.columns else np.nan
+    df["multiplier"] = (
+        pd.to_numeric(df["option_contract_multiplier"], errors="coerce")
+        if "option_contract_multiplier" in df.columns
+        else np.nan
+    )
+    df["contract_size"] = (
+        pd.to_numeric(df["option_contract_size"], errors="coerce")
+        if "option_contract_size" in df.columns
+        else np.nan
+    )
     df["oi"] = pd.to_numeric(df["option_open_interest"], errors="coerce").fillna(0)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["bid"] = pd.to_numeric(df["bid_price"], errors="coerce")
@@ -209,13 +225,40 @@ def clean_option_chain(df: pd.DataFrame, cfg: VolSurfaceConfig) -> pd.DataFrame:
     return out.sort_values(["dte", "strike"]).reset_index(drop=True)
 
 
+def clean_gex_chain(df: pd.DataFrame, cfg: VolSurfaceConfig) -> pd.DataFrame:
+    """Keep 0DTE and wings for GEX; do not apply the tight IV-surface smile filter."""
+    out = df.copy()
+    if "option_valid" in out.columns:
+        out = out[out["option_valid"].fillna(False)]
+    out = out[out["dte"].between(cfg.fetch_min_dte, cfg.max_dte)]
+    if "ks_ratio" not in out.columns:
+        out["ks_ratio"] = out["strike"] / out["spot"]
+    out = out[out["ks_ratio"].between(cfg.fetch_moneyness_min, cfg.fetch_moneyness_max)]
+    has_gamma = out["gamma"].notna() & np.isfinite(out["gamma"]) if "gamma" in out.columns else False
+    has_iv = out["iv"].between(cfg.min_iv, cfg.max_iv) if "iv" in out.columns else False
+    if isinstance(has_gamma, pd.Series) and isinstance(has_iv, pd.Series):
+        out = out[has_gamma | has_iv]
+    out = out.dropna(subset=["strike", "dte"])
+    return out.sort_values(["dte", "strike"]).reset_index(drop=True)
+
+
 def fetch_spot_yfinance(ticker: str) -> tuple[float, date]:
     if yf is None:
         raise ImportError("yfinance is required for index spot fallback")
     raw = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
-    if raw is None or raw.empty or "Close" not in raw:
+    if raw is None or raw.empty:
         raise RuntimeError(f"No yfinance close for {ticker}")
-    close = raw["Close"]
+    
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):
+            close = raw["Close"]
+        else:
+            raise RuntimeError(f"No yfinance close for {ticker}")
+    elif "Close" in raw.columns:
+        close = raw["Close"]
+    else:
+        raise RuntimeError(f"No yfinance close for {ticker}")
+
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     price = float(close.dropna().iloc[-1])
@@ -252,37 +295,83 @@ def fetch_option_chain_futu(
     if ret != ft.RET_OK or exp.empty:
         raise RuntimeError(f"Failed to fetch option expirations for {cfg.underlying}: {exp}")
 
-    expiries = pd.to_datetime(exp["strike_time"])
-    end_date = (asof + timedelta(days=cfg.max_dte)).strftime("%Y-%m-%d")
-    start_date = asof.strftime("%Y-%m-%d")
-    valid = expiries[(expiries >= pd.Timestamp(asof)) & (expiries <= pd.Timestamp(end_date))]
+    expiries = pd.to_datetime(exp["strike_time"]).sort_values()
+    window_end = pd.Timestamp(asof) + timedelta(days=cfg.max_dte)
+    valid = expiries[
+        (expiries >= pd.Timestamp(asof)) & (expiries <= window_end)
+    ].drop_duplicates()
     if valid.empty:
-        raise RuntimeError(f"No option expiries within {cfg.max_dte}d for {cfg.underlying}")
+        raise RuntimeError(
+            f"No option expiries within {cfg.max_dte}d for {cfg.underlying} "
+            f"(asof={asof}, first listed={expiries.min().date() if len(expiries) else 'n/a'})"
+        )
+
+    expiry_days = [pd.Timestamp(x).normalize() for x in valid]
+    chain_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    i = 0
+    while i < len(expiry_days):
+        ws = expiry_days[i]
+        we = ws
+        j = i
+        while j < len(expiry_days) and (expiry_days[j] - ws).days <= 29:
+            we = expiry_days[j]
+            j += 1
+        chain_windows.append((ws, we))
+        i = j
+
+    print(
+        f"[chain] {cfg.underlying} asof={asof} spot={spot:.2f} "
+        f"expiries={len(expiry_days)} windows={len(chain_windows)}",
+        flush=True,
+    )
 
     chain_parts: list[pd.DataFrame] = []
-    window_start = pd.Timestamp(asof)
-    window_end_limit = pd.Timestamp(end_date)
-    while window_start <= window_end_limit:
-        batch_end = min(window_start + timedelta(days=29), window_end_limit)
-        ret, chain = quote_ctx.get_option_chain(
-            cfg.underlying,
-            start=window_start.strftime("%Y-%m-%d"),
-            end=batch_end.strftime("%Y-%m-%d"),
-        )
-        if ret == ft.RET_OK and not chain.empty:
-            chain_parts.append(chain)
-        window_start = batch_end + timedelta(days=1)
+    chain_errors: list[str] = []
+    for ws, we in chain_windows:
+        start_s = ws.strftime("%Y-%m-%d")
+        end_s = we.strftime("%Y-%m-%d")
+        last_err: str | None = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(SNAPSHOT_PAUSE_SEC * attempt)
+            ret, chain = quote_ctx.get_option_chain(
+                cfg.underlying,
+                start=start_s,
+                end=end_s,
+            )
+            if ret == ft.RET_OK and isinstance(chain, pd.DataFrame):
+                if chain.empty:
+                    logger.info("No contracts in expiry window %s..%s", start_s, end_s)
+                    last_err = None
+                    break
+                chain_parts.append(chain)
+                last_err = None
+                print(f"[chain] {start_s}..{end_s} -> {len(chain)} contracts", flush=True)
+                break
+            last_err = str(chain)
+            logger.warning(
+                "get_option_chain %s %s..%s attempt %d: ret=%s %s",
+                cfg.underlying,
+                start_s,
+                end_s,
+                attempt + 1,
+                ret,
+                chain,
+            )
+        if last_err:
+            chain_errors.append(f"{start_s}..{end_s}: {last_err}")
 
     if not chain_parts:
-        raise RuntimeError(f"Empty option chain for {cfg.underlying}")
+        detail = "; ".join(chain_errors) if chain_errors else "all expiry windows empty"
+        raise RuntimeError(f"Empty option chain for {cfg.underlying}: {detail}")
 
     chain_meta = pd.concat(chain_parts, ignore_index=True).drop_duplicates(subset=["code"])
     chain_meta["expiry"] = pd.to_datetime(chain_meta["strike_time"])
     chain_meta["dte"] = (chain_meta["expiry"] - pd.Timestamp(asof)).dt.days
-    strike_lo = spot / cfg.moneyness_max
-    strike_hi = spot / cfg.moneyness_min
+    strike_lo = spot * cfg.fetch_moneyness_min
+    strike_hi = spot * cfg.fetch_moneyness_max
     chain_meta = chain_meta[
-        chain_meta["dte"].between(cfg.min_dte, cfg.max_dte)
+        chain_meta["dte"].between(cfg.fetch_min_dte, cfg.max_dte)
         & chain_meta["strike_price"].between(strike_lo, strike_hi)
     ]
     codes = chain_meta["code"].dropna().unique().tolist()
@@ -304,7 +393,7 @@ def fetch_option_chain_futu(
 
     snap = pd.concat(snap_parts, ignore_index=True).drop_duplicates(subset=["code"])
     std = _standardize_chain(snap, spot=spot, asof=asof)
-    return clean_option_chain(std, cfg)
+    return clean_gex_chain(std, cfg)
 
 
 def ensure_runtime_deps(*, upgrade_futu: bool = True, install_pyarrow: bool = True) -> str:
@@ -671,6 +760,98 @@ def build_iv_grid(
     return grid_dte, grid_ks, iv_grid
 
 
+def _svi_total_var(k: np.ndarray, a: float, b: float, rho: float, m: float, sigma: float) -> np.ndarray:
+    """Gatheral raw SVI: w(k) = a + b (ρ (k-m) + sqrt((k-m)² + σ²))."""
+    x = np.asarray(k, dtype=float) - m
+    return a + b * (rho * x + np.sqrt(x * x + sigma * sigma))
+
+
+def _fit_svi_slice(k: np.ndarray, w: np.ndarray) -> tuple[float, float, float, float, float] | None:
+    k = np.asarray(k, dtype=float)
+    w = np.asarray(w, dtype=float)
+    ok = np.isfinite(k) & np.isfinite(w) & (w > 0)
+    k, w = k[ok], w[ok]
+    if k.size < 5:
+        return None
+    order = np.argsort(k)
+    k, w = k[order], w[order]
+    w_atm = float(np.interp(0.0, k, w))
+    x0 = np.array([max(w_atm * 0.5, 1e-4), 0.12, -0.45, 0.0, 0.12], dtype=float)
+    lo = np.array([-0.5, 1e-4, -0.999, float(k.min()) - 0.15, 1e-3])
+    hi = np.array([1.5, 4.0, 0.999, float(k.max()) + 0.15, 2.0])
+
+    def resid(p: np.ndarray) -> np.ndarray:
+        a, b, rho, m, sig = p
+        what = _svi_total_var(k, a, b, rho, m, sig)
+        wmin = a + b * sig * np.sqrt(max(1.0 - rho * rho, 0.0))
+        pen = np.array([0.0 if wmin >= 0 else 20.0 * wmin])
+        return np.concatenate([what - w, pen])
+
+    try:
+        fit = least_squares(resid, x0, bounds=(lo, hi), max_nfev=80, ftol=1e-10)
+    except Exception:
+        return None
+    params = tuple(float(v) for v in fit.x)
+    what = _svi_total_var(k, *params)
+    if not np.all(np.isfinite(what)) or float(np.min(what)) < -1e-6:
+        return None
+    rmse = float(np.sqrt(np.mean((what - w) ** 2)))
+    if rmse > max(0.05, 2.0 * float(np.std(w))):
+        return None
+    return params  # type: ignore[return-value]
+
+
+def smooth_iv_grid_svi(
+    df: pd.DataFrame,
+    grid_dte: np.ndarray,
+    grid_ks: np.ndarray,
+    iv_grid: np.ndarray,
+    *,
+    dte_window: int = 4,
+    iv_lo: float = 5.0,
+    iv_hi: float = 150.0,
+) -> np.ndarray:
+    """Per-DTE Gatheral SVI smile; quadratic fallback if a slice will not fit.
+
+    Mispricing detector uses raw IV minus this model IV.
+    """
+    sub = df[np.isfinite(df["iv"]) & np.isfinite(df["dte"])].copy()
+    if "ks_ratio" not in sub.columns:
+        sub["ks_ratio"] = sub["option_strike_price"] / sub["spot"]
+
+    # OTM selection with ATM buffer: puts on left wing, calls on right wing
+    atm_half_width = 0.03
+    otm_mask = (
+        (sub["option_type"].str.upper().str.contains("PUT") & (sub["ks_ratio"] <= 1.0 + atm_half_width))
+        | (sub["option_type"].str.upper().str.contains("CALL") & (sub["ks_ratio"] >= 1.0 - atm_half_width))
+    )
+    sub = sub[otm_mask]
+
+    grouped = sub.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
+    dte_axis = grid_dte[:, 0]
+    ks_axis = grid_ks[0, :]
+    iv_smooth = np.zeros_like(iv_grid)
+    quad = smooth_iv_grid_quadratic(
+        df, grid_dte, grid_ks, iv_grid, dte_window=dte_window, iv_lo=iv_lo, iv_hi=iv_hi
+    )
+    for i, dte in enumerate(dte_axis):
+        slice_df = grouped[np.abs(grouped["dte"] - dte) <= dte_window]
+        t = max(float(dte), 1.0) / 365.0
+        if len(slice_df) < 5:
+            iv_smooth[i, :] = quad[i, :]
+            continue
+        k_pts = np.log(slice_df["ks_ratio"].to_numpy())
+        w_pts = (slice_df["iv"].to_numpy() / 100.0) ** 2 * t
+        params = _fit_svi_slice(k_pts, w_pts)
+        if params is None:
+            iv_smooth[i, :] = quad[i, :]
+            continue
+        k_grid = np.log(ks_axis)
+        w_hat = np.maximum(_svi_total_var(k_grid, *params), 1e-8)
+        iv_smooth[i, :] = np.clip(np.sqrt(w_hat / t) * 100.0, iv_lo, iv_hi)
+    return iv_smooth
+
+
 def smooth_iv_grid_quadratic(
     df: pd.DataFrame,
     grid_dte: np.ndarray,
@@ -685,6 +866,15 @@ def smooth_iv_grid_quadratic(
     sub = df[np.isfinite(df["iv"]) & np.isfinite(df["dte"])].copy()
     if "ks_ratio" not in sub.columns:
         sub["ks_ratio"] = sub["option_strike_price"] / sub["spot"]
+
+    # OTM selection with ATM buffer: puts on left wing, calls on right wing
+    atm_half_width = 0.03
+    otm_mask = (
+        (sub["option_type"].str.upper().str.contains("PUT") & (sub["ks_ratio"] <= 1.0 + atm_half_width))
+        | (sub["option_type"].str.upper().str.contains("CALL") & (sub["ks_ratio"] >= 1.0 - atm_half_width))
+    )
+    sub = sub[otm_mask]
+
     grouped = sub.groupby(["dte", "ks_ratio"])["iv"].mean().reset_index()
     dte_axis = grid_dte[:, 0]
     ks_axis = grid_ks[0, :]
@@ -730,7 +920,7 @@ def dupire_local_vol(
     r: float = 0.045,
 ) -> np.ndarray:
     """Dupire local vol (%) from an implied-vol grid."""
-    t_years = np.maximum(grid_dte / TRADING_DAYS, 1 / TRADING_DAYS)
+    t_years = np.maximum(grid_dte / 365.0, 1.0 / 365.0)
     strike_grid = grid_ks * spot
     call_grid = bs_call_price(spot, strike_grid, t_years, r, iv_grid / 100.0)
 
@@ -876,7 +1066,7 @@ def dupire_local_vol_delta(
     r: float = 0.045,
 ) -> np.ndarray:
     """Dupire local vol (%) from an IV surface gridded on (DTE, delta)."""
-    t_years = np.maximum(grid_dte / TRADING_DAYS, 1.0 / TRADING_DAYS)
+    t_years = np.maximum(grid_dte / 365.0, 1.0 / 365.0)
     strike_grid = np.zeros_like(iv_grid)
     n_dte, n_delta = iv_grid.shape
     for i in range(n_dte):
@@ -1468,8 +1658,12 @@ def _yf_close(ticker: str, period: str = "3mo") -> pd.Series:
 
 def fetch_vix_context(lookback_days: int = 5, trading_days: int = TRADING_DAYS) -> dict[str, Any]:
     """VIX / realized-vol context for multi-day IV level comparison when surface cache is sparse."""
-    vix = _yf_close(VIX_TICKER)
-    spx = _yf_close(SPX_TICKER)
+    try:
+        vix = _yf_close(VIX_TICKER)
+        spx = _yf_close(SPX_TICKER)
+    except Exception as e:
+        logger.warning(f"Failed to fetch VIX context: {e}")
+        return {}
     df = pd.concat({"VIX": vix, "SPX": spx}, axis=1, join="inner").dropna()
     df["log_ret"] = np.log(df["SPX"] / df["SPX"].shift(1))
     df["RV_22"] = df["log_ret"].rolling(22).std() * np.sqrt(trading_days) * 100
@@ -1580,7 +1774,7 @@ def detect_surface_anomalies(
 
     Detection families
     ------------------
-    1. smooth_residual — raw IV vs quadratic-smooth smile residual (MAD z)
+    1. smooth_residual — raw IV vs per-expiry SVI smile residual (MAD z)
     2. local_spike — node vs 4-neighbor mean on the IV grid (MAD z)
     3. lv_invalid / lv_explosion — Dupire holes or LV ≫ IV
     4. structure — term hump, extreme skew / butterfly levels
@@ -1633,7 +1827,7 @@ def detect_surface_anomalies(
             value=float(iv_raw[i, j]),
             baseline=float(iv_smooth[i, j]),
             score=z_abs,
-            detail=f"Raw IV residual {r:+.1f} vol pts vs smooth smile (z={resid_z[i, j]:+.1f})",
+            detail=f"Raw IV residual {r:+.1f} vol pts vs SVI smile (z={resid_z[i, j]:+.1f})",
         )
 
     # --- 2) Local neighborhood spikes on raw IV ---
@@ -1767,7 +1961,7 @@ def detect_surface_anomalies(
         anomalies[-1]["dte"] = 30.0
 
     anomalies.sort(key=lambda a: abs(float(a.get("score") or 0.0)), reverse=True)
-    return anomalies
+    return anomalies[:5]
 
 
 def load_deepseek_api_key(env_path: Path | None = None) -> str | None:
@@ -1806,8 +2000,9 @@ def deepseek_enhance_commentary(
             {
                 "role": "system",
                 "content": (
-                    "You are an equity derivatives strategist. Refine the rule-based draft "
-                    "using only the supplied metrics. Do not invent data. No price targets."
+                    "You are a ruthless quantitative options strategist. Refine the rule-based draft "
+                    "into exactly one sentence stating if the market is in PANIC or GREED, and one sentence of evidence. "
+                    "Use only the supplied metrics. Do not invent data. No fluff."
                 ),
             },
             {
@@ -2143,30 +2338,15 @@ def _today_vs_recent(deltas: np.ndarray) -> tuple[str, float]:
     return tag, z
 
 
-def _pc_intensity_label(z: float, *, pos_label: str, neg_label: str, mild_threshold: float = 1.0) -> str:
-    if z >= mild_threshold:
-        return pos_label
-    if z <= -mild_threshold:
-        return neg_label
-    return "little net tilt in this mode today"
-
-
 def build_structure_metrics_insights(
     today: dict[str, Any],
     vix_ctx: dict[str, Any] | None,
     anchor_ctx: dict[str, Any] | None,
-    today_scores: list[float] | np.ndarray,
-    pca_sentiment: dict[str, Any] | None,
-    pca_score_history: np.ndarray | None = None,
     changes: pd.DataFrame | None = None,
 ) -> list[dict[str, str]]:
     """Rule-based metric lines + natural-language insights for the structure panel."""
     vix_ctx = vix_ctx or {}
     anchor_ctx = anchor_ctx or {}
-    scores = np.asarray(today_scores, dtype=float) if today_scores is not None else np.zeros(4)
-    pc1 = float(scores[0]) if len(scores) > 0 else 0.0
-    pc2 = float(scores[1]) if len(scores) > 1 else 0.0
-    pc3 = float(scores[2]) if len(scores) > 2 else 0.0
 
     aiv = float(today.get("atm_iv_30d", np.nan))
     vix = float(vix_ctx.get("vix", np.nan))
@@ -2291,69 +2471,8 @@ def build_structure_metrics_insights(
     if not bfly_parts:
         bfly_parts.append("Wing curvature is muted — tail pricing is not the main story today.")
 
-    # --- PCA ---
-    pca_metric = f"PCA Delta Systemic Shocks: PC1 (Shift) = {pc1:.2f} | PC2 (Skew Tilt) = {pc2:.2f}"
-    pca_parts: list[str] = []
-    z_scores = (pca_sentiment or {}).get("z_scores") or []
-    z1 = float(z_scores[0]) if len(z_scores) > 0 else pc1
-    z2 = float(z_scores[1]) if len(z_scores) > 1 else pc2
-    z3 = float(z_scores[2]) if len(z_scores) > 2 else pc3
-
-    pca_parts.append(
-        _pc_intensity_label(
-            z1,
-            pos_label="PC1: broad parallel shift UP — the whole surface repriced higher across strikes/tenors (vol level shock).",
-            neg_label="PC1: broad parallel shift DOWN — systemic vol compression across the surface.",
-        )
-    )
-    pca_parts.append(
-        _pc_intensity_label(
-            z2,
-            pos_label="PC2: skew steepening — put-side IV rising faster than calls; downside protection demand dominates.",
-            neg_label="PC2: skew flattening — call wing IV bid up relative to puts; upside/convexity catching a bid.",
-            mild_threshold=0.8,
-        )
-    )
-    if abs(z3) >= 0.8:
-        pca_parts.append(
-            _pc_intensity_label(
-                z3,
-                pos_label="PC3: wing/tail curvature expanding — far OTM options repricing faster (tail risk bid).",
-                neg_label="PC3: wing curvature compressing — tails cheapening vs the belly.",
-                mild_threshold=0.8,
-            )
-        )
-
-    if pca_score_history is not None and len(pca_score_history) >= 3:
-        pc1_hist = pca_score_history[:, 0]
-        pc1_d = np.diff(pc1_hist)
-        streak, direction = _consecutive_streak(pc1_d)
-        rhythm, z = _today_vs_recent(pc1_d)
-        if streak >= 3:
-            pca_parts.append(
-                f"PC1 has moved the same direction for {streak} sessions — surface level shifts are stacking, not reversing."
-            )
-        elif abs(z) >= 1.5:
-            pca_parts.append(f"Today's PC1 move breaks the recent pattern ({rhythm}).")
-    elif len(atm_deltas) >= 2:
-        streak, _ = _consecutive_streak(atm_deltas)
-        rhythm, z = _today_vs_recent(atm_deltas)
-        if streak >= 3:
-            pca_parts.append(
-                f"Without full surface history, anchor ATM IV shows {streak} days of same-direction level drift — likely a sustained PC1-style shift."
-            )
-        elif abs(z) >= 1.5:
-            pca_parts.append(f"Today's ATM IV change stands out vs the past week ({rhythm}).")
-
-    if len(call_deltas) >= 2:
-        streak, direction = _consecutive_streak(call_deltas)
-        if streak >= 3 and direction == "up":
-            pca_parts.append(
-                f"Call-wing IV vs ATM has risen for {streak} straight sessions — consistent with PC2 call-skew bid."
-            )
-
     if np.isfinite(tsl) and abs(tsl) > 2:
-        pca_parts.append(
+        vol_parts.append(
             f"Term slope {tsl:+.1f} vol pts — "
             + ("front-end IV elevated vs back (event/near-term fear)." if tsl > 0 else "back-end IV holds up vs front (longer-dated uncertainty).")
         )
@@ -2362,7 +2481,6 @@ def build_structure_metrics_insights(
         {"key": "vol_level", "metric": vol_metric, "insight": " ".join(vol_parts)},
         {"key": "skew", "metric": skew_metric, "insight": " ".join(skew_parts)},
         {"key": "butterfly", "metric": bfly_metric, "insight": " ".join(bfly_parts)},
-        {"key": "pca", "metric": pca_metric, "insight": " ".join(pca_parts)},
     ]
 
 
@@ -2382,12 +2500,13 @@ def deepseek_enhance_structure_insights(
             {
                 "role": "system",
                 "content": (
-                    "You are an equity index options strategist writing dashboard copy. "
-                    "For each metric block, rewrite ONLY the insight field: 1-2 crisp sentences, "
-                    "trader-facing, no bullet lists, no invented numbers, no price targets. "
-                    "Emphasize whether moves are multi-day streaks vs today's outlier, and PCA surface dynamics "
-                    "(level shift, skew tilt, call vs put wing). Return valid JSON array of "
-                    "objects with keys: key, metric, insight. Keep metric strings unchanged."
+                    "You are a ruthless quantitative options strategist. No fluff, no storytelling. "
+                    "You will receive 3 metric blocks and a context object (HMM regime, SSR, VRP, GEX, Anomalies). "
+                    "Task 1: Add a new block with key='sentiment' at the VERY BEGINNING. "
+                    "For its 'metric' field, output exactly: 'Market State: [PANIC / GREED / NEUTRAL]'. "
+                    "For its 'insight' field, provide a direct, ultra-concise conclusion interpreting Vol and SSR to justify the market state. No fluff, direct conclusion. "
+                    "Task 2: Rewrite the 'insight' field for the 3 existing blocks (vol_level, skew, butterfly) to be ultra-concise (under 10 words). "
+                    "Return a JSON object with a single key 'blocks' containing an array of 4 objects with keys: key, metric, insight. Keep the original metric strings unchanged for the first 3 blocks. Make sure the 'sentiment' block is the first one in the array."
                 ),
             },
             {
@@ -2417,6 +2536,14 @@ def deepseek_enhance_structure_insights(
             return metrics
         by_key = {str(r.get("key")): r for r in rows if isinstance(r, dict) and r.get("key")}
         out: list[dict[str, str]] = []
+        # Prepend the sentiment block if it was generated
+        if "sentiment" in by_key and by_key["sentiment"].get("insight"):
+            out.append({
+                "key": "sentiment",
+                "metric": str(by_key["sentiment"].get("metric", "Market Sentiment & Hedging Demand")),
+                "insight": str(by_key["sentiment"]["insight"]).strip(),
+            })
+            
         for block in metrics:
             key = block["key"]
             if key in by_key and by_key[key].get("insight"):
@@ -2427,6 +2554,7 @@ def deepseek_enhance_structure_insights(
                 })
             else:
                 out.append(block)
+        
         return out
     except (error.URLError, KeyError, json.JSONDecodeError, TypeError) as exc:
         logger.warning("DeepSeek structure insights failed: %s", exc)
@@ -2525,6 +2653,7 @@ class VolSurfaceStudy:
     def __init__(self, cfg: VolSurfaceConfig | None = None):
         self.cfg = cfg or VolSurfaceConfig()
         self.surfaces: dict[date, pd.DataFrame] = {}
+        self.gex_chains: dict[date, pd.DataFrame] = {}
         self.features: dict[date, dict[str, Any]] = {}
         self.local_vols: dict[date, np.ndarray] = {}
         self.grids: dict[date, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -2535,16 +2664,21 @@ class VolSurfaceStudy:
         self._delta_plot_views = None
 
     def _compute_surface(self, d: date, df: pd.DataFrame) -> None:
-        self.surfaces[d] = df
-        self.features[d] = compute_surface_features(df, self.cfg)
-        spot = float(df["spot"].iloc[0])
+        self.gex_chains[d] = df
+        surface_df = clean_option_chain(df, self.cfg)
+        if surface_df.empty:
+            surface_df = df
+            logger.warning("Surface filter emptied the chain for %s; using unfiltered snapshot.", d)
+        self.surfaces[d] = surface_df
+        self.features[d] = compute_surface_features(surface_df, self.cfg)
+        spot = float(surface_df["spot"].iloc[0])
         try:
-            grid = build_iv_grid(df, max_dte=self.cfg.max_dte)
+            grid = build_iv_grid(surface_df, max_dte=self.cfg.max_dte)
             self.grids[d] = grid
         except ValueError as exc:
             logger.warning("Moneyness IV grid skipped for %s: %s", d, exc)
         try:
-            delta_grid = build_iv_grid_delta(df, max_dte=self.cfg.max_dte)
+            delta_grid = build_iv_grid_delta(surface_df, max_dte=self.cfg.max_dte)
             self.delta_grids[d] = delta_grid
             g_dte, g_delta, iv_g = delta_grid
             if g_dte.shape[0] >= 2:
@@ -2563,10 +2697,11 @@ class VolSurfaceStudy:
             self.surfaces, self.cfg.lookback_days + 1, business_days=True
         )
         self.features.clear()
+        self.gex_chains.clear()
         self.local_vols.clear()
         self.grids.clear()
         self.delta_grids.clear()
-        for d, df in self.surfaces.items():
+        for d, df in list(self.surfaces.items()):
             self._compute_surface(d, df)
 
     def ensure_history(
@@ -2586,10 +2721,11 @@ class VolSurfaceStudy:
                 self.surfaces, self.cfg.lookback_days + 1, business_days=True
             )
             self.features.clear()
+            self.gex_chains.clear()
             self.local_vols.clear()
             self.grids.clear()
             self.delta_grids.clear()
-            for d, df in self.surfaces.items():
+            for d, df in list(self.surfaces.items()):
                 self._compute_surface(d, df)
 
         if not self.surfaces:
@@ -2605,6 +2741,7 @@ class VolSurfaceStudy:
         """Fetch today's option chain from Futu; by default no disk cache."""
         self._invalidate_plot_cache()
         self.surfaces.clear()
+        self.gex_chains.clear()
         self.features.clear()
         self.local_vols.clear()
         self.grids.clear()
@@ -2612,7 +2749,7 @@ class VolSurfaceStudy:
         df = fetch_and_cache(self.cfg, save=save)
         asof = pd.Timestamp(df["asof_date"].iloc[0]).date()
         self._compute_surface(asof, df)
-        return df
+        return self.surfaces[asof]
 
     def analyze(self) -> dict[str, Any]:
         if not self.features:
@@ -2964,8 +3101,8 @@ class VolSurfaceStudy:
         x_ks = g_ks[0, :]
         y_dte = g_dte[:, 0]
 
-        iv_g_smooth = smooth_iv_grid_quadratic(df_today, g_dte, g_ks, iv_g)
-        lv = dupire_local_vol(spot, g_dte, g_ks, iv_g_smooth, r=self.cfg.risk_free_rate)
+        iv_g_smooth = smooth_iv_grid_svi(df_today, g_dte, g_ks, iv_g)
+        lv = dupire_local_vol(spot, g_dte, g_ks, iv_g, r=self.cfg.risk_free_rate)
 
         fig = go.Figure()
         
@@ -2977,7 +3114,7 @@ class VolSurfaceStudy:
             opacity=1.0,
         ))
 
-        # 2. Processed smooth Model IV (SVI-style quadratic regression)
+        # 2. SVI model IV (mispricing residual = raw − SVI)
         fig.add_trace(go.Surface(
             x=x_ks, y=y_dte, z=iv_g_smooth,
             name="Smooth Implied Vol", colorscale="Cividis", visible=False,
@@ -3017,152 +3154,6 @@ class VolSurfaceStudy:
             width=820, height=580,
         )
         return fig
-
-    def plot_sentiment_gauge(
-        self,
-        result: dict[str, Any],
-        today_scores: np.ndarray,
-        sentiment: dict[str, Any],
-    ) -> Any:
-        """Render a dual-panel Matte-Speedometer Gauge + Short Environment Summary."""
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-
-        today_d = latest_business_session(self.surfaces)
-        today_f = self.features[today_d]
-        aiv = float(today_f.get("atm_iv_30d", np.nan))
-        psk = float(today_f.get("skew_25d", np.nan))
-        tsl = float(today_f.get("term_slope", np.nan))
-        vix = float(result.get("vix_context", {}).get("vix", np.nan))
-
-        anomalies = result["anomalies"]
-        if result["changes"] is not None and not result["changes"].empty:
-            chg = result["changes"]
-            def d5(name):
-                row = chg.loc[chg["feature"]==name]
-                return float(row["delta_5d"].iloc[0]) if not row.empty and np.isfinite(row["delta_5d"].iloc[0]) else 0.0
-            d_skew = d5("skew_25d")
-            d_bfly = d5("butterfly_25d")
-        else:
-            d_skew = 0.0
-            d_bfly = 0.0
-
-        vrp_val = result.get("vix_context", {}).get("vrp", vix - aiv)
-        anchor_ctx = result.get("anchor_context", {})
-        anchor_changes = anchor_ctx.get("changes", {})
-        skew_proxy_chg = anchor_changes.get("skew_proxy", 0.0)
-
-        ps = np.clip(-psk * 4.0, -35, 35)
-        ts_factor = np.clip(tsl * 5.0, -25, 25)
-        vix_component = np.clip((20.0 - vix) * 2.0, -20, 20) if np.isfinite(vix) else 0.0
-        vrp_factor = np.clip((6.0 - vrp_val) * 2.5, -15, 15) if np.isfinite(vrp_val) else 0.0
-        anchor_skew_factor = np.clip(-skew_proxy_chg * 5.0, -10, 10) if np.isfinite(skew_proxy_chg) else 0.0
-
-        sentiment_score = float(np.clip(ps + ts_factor + vix_component + vrp_factor + anchor_skew_factor, -100, 100))
-
-        if sentiment_score > 50:
-            sentiment_label = "Extremely Bullish"
-            sentiment_color = "#27ae60"
-        elif sentiment_score > 15:
-            sentiment_label = "Slightly Bullish"
-            sentiment_color = "#2ecc71"
-        elif sentiment_score > -15:
-            sentiment_label = "Neutral"
-            sentiment_color = "#f1c40f"
-        elif sentiment_score > -50:
-            sentiment_label = "Slightly Bearish"
-            sentiment_color = "#e67e22"
-        else:
-            sentiment_label = "Extremely Bearish"
-            sentiment_color = "#e74c3c"
-
-        fig, (ax_gauge, ax_text) = plt.subplots(1, 2, figsize=(12, 4.5), gridspec_kw={'width_ratios': [1, 1.25]})
-
-        # Speedometer Gauge
-        r_outer = 1.0
-        r_inner = 0.7
-        colors = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#27ae60"]
-        angles = np.linspace(np.pi, 0, 6)
-
-        for i in range(5):
-            t_seg = np.linspace(angles[i], angles[i+1], 50)
-            x_outer = r_outer * np.cos(t_seg)
-            y_outer = r_outer * np.sin(t_seg)
-            x_inner = r_inner * np.cos(t_seg)
-            y_inner = r_inner * np.sin(t_seg)
-            x_polygon = np.concatenate([x_outer, x_inner[::-1]])
-            y_polygon = np.concatenate([y_outer, y_inner[::-1]])
-            ax_gauge.fill(x_polygon, y_polygon, color=colors[i], alpha=0.85)
-
-        normalized_score = (sentiment_score + 100.0) / 200.0
-        needle_angle = np.pi - normalized_score * np.pi
-
-        needle_len = 0.95
-        ax_gauge.annotate(
-            "",
-            xy=(needle_len * np.cos(needle_angle), needle_len * np.sin(needle_angle)),
-            xytext=(0, 0),
-            arrowprops=dict(arrowstyle="wedge,tail_width=0.35,shrink_factor=0.5", color="#2c3e50", zorder=10)
-        )
-
-        center_circle = patches.Circle((0, 0), 0.12, color="#2c3e50", zorder=11)
-        center_rim = patches.Circle((0, 0), 0.15, fill=False, edgecolor="#7f8c8d", lw=1.5, zorder=12)
-        ax_gauge.add_patch(center_circle)
-        ax_gauge.add_patch(center_rim)
-
-        ticks = [-100, -50, 0, 50, 100]
-        for val in ticks:
-            t_val = np.pi - ((val + 100.0) / 200.0) * np.pi
-            tx = (r_outer + 0.12) * np.cos(t_val)
-            ty = (r_outer + 0.12) * np.sin(t_val)
-            ax_gauge.text(tx, ty, str(val), ha="center", va="center", fontsize=9, fontweight="bold", color="#7f8c8d")
-
-        ax_gauge.text(0, -0.15, sentiment_label, ha="center", va="center", fontsize=15, fontweight="bold", color=sentiment_color)
-        ax_gauge.text(0, -0.32, f"Sentiment Score: {sentiment_score:+.1f} / 100", ha="center", va="center", fontsize=11, fontweight="bold", color="#34495e")
-
-        ax_gauge.set_xlim(-1.25, 1.25)
-        ax_gauge.set_ylim(-0.45, 1.25)
-        ax_gauge.axis("off")
-
-        # Bullets Summary
-        ax_text.axis("off")
-        box = patches.FancyBboxPatch(
-            (0.01, 0.01), 0.98, 0.98,
-            boxstyle="round,pad=0.03",
-            facecolor="#fdfefe", edgecolor="#d5dbdb", lw=1.5
-        )
-        ax_text.add_patch(box)
-
-        joint_flag_str = sentiment["joint_flags"][0].upper().replace("_", " ") if sentiment["joint_flags"] else "NEUTRAL"
-        pc1_score = today_scores[0]
-        pc2_score = today_scores[1]
-
-        hump_active = anomalies.get("event_hump", False)
-        term_narrative = f"Hump @ {anomalies.get('hump_dte', 0):.0f}d" if hump_active else "No Hump"
-        bfly_today = today_f.get("butterfly_25d", np.nan)
-
-        bullet_points = [
-            f"# Market Volatility Structure (As of {today_d})",
-            f"• Implied Pricing: ATM 30d IV = {aiv:.1f}% | VIX index baseline = {vix:.1f}%",
-            f"• Vol Risk Premium (VRP): {vrp_val:+.1f} pts (VIX premium over 22d Realized Vol)",
-            f"• Put/Call Skew Premium: 25d put spread skew = {psk:+.1f} vol pts (5d delta: {d_skew:+.1f} pts)",
-            f"• Curvature & Fly Convexity: 25d butterfly = {bfly_today:+.1f} vol pts (5d delta: {d_bfly:+.1f} pts)",
-            f"• Term Structure Tenor: Front vs back roll spread = {tsl:+.1f} vol pts ({term_narrative})",
-            f"• Surface Delta PCA Shocks: PC1 parallel shift = {pc1_score:+.2f} | PC2 skew tilt = {pc2_score:+.2f}",
-        ]
-
-        y_pos = 0.88
-        for line in bullet_points:
-            is_header = line.startswith("#")
-            display_line = line.replace("# ", "") if is_header else line
-            font_w = "bold" if is_header else "normal"
-            font_s = 12 if is_header else 10.2
-            font_c = "#2c3e50" if is_header else "#34495e"
-            ax_text.text(0.05, y_pos, display_line, fontsize=font_s, fontweight=font_w, color=font_c, va="center")
-            y_pos -= 0.12
-
-        plt.tight_layout()
-        plt.show()
 
     def print_conclusion(self, *, delta_lo: float = -0.05, delta_hi: float = 0.05) -> None:
         print(build_study_conclusion(self, delta_lo=delta_lo, delta_hi=delta_hi))

@@ -2,9 +2,9 @@
 
 ![Index Quant Signal Hub — SPX Dashboard](demo/signal_page.png)
 
-*Index Quant Signal Hub — integrated 3D volatility surface, sentiment compass, HMM regime signals, VRP/term-structure metrics, and 1-sigma move targets for **SPX, NDX, and DJI**.*
+*Index Quant Signal Hub — integrated 3D volatility surface, dealer GEX by TTM, HMM regime signals, VRP/term-structure metrics, and 1-sigma move targets for **SPX, NDX, and DJI**.*
 
-*Index Quant Signal Hub — 集成 3D 波动率曲面、情绪罗盘、HMM 机制信号、VRP/期限结构指标及 1-sigma 波动目标，覆盖 **SPX、NDX、DJI** 三大指数。*
+*Index Quant Signal Hub — 集成 3D 波动率曲面、分到期 GEX、HMM 机制信号、VRP/期限结构指标及 1-sigma 波动目标，覆盖 **SPX、NDX、DJI** 三大指数。*
 
 ---
 
@@ -25,9 +25,9 @@ The live dashboard tab labels match the indices below. Option surfaces are pulle
 # Signal Monitor — Equity Volatility Regime & Option Sentiment Dashboard
 # Signal Monitor — 美股波动率机制与期权情绪监测看板
 
-An enterprise-grade research and live production dashboard designed to monitor and trade equity markets using Option Volatility Surface structure, Dupire Local Volatility, Principal Component Analysis (PCA) sentiment, and a 2-state Gaussian Hidden Markov Model (HMM) volatility regime model.
+An enterprise-grade research and live production dashboard designed to monitor and trade equity markets using Option Volatility Surface structure, Dupire Local Volatility, dealer Gamma Exposure (GEX), and a 2-state Gaussian Hidden Markov Model (HMM) volatility regime model.
 
-这是一个企业级的量化研究与实盘显示看板。它利用期权隐含波动率曲面（Option Volatility Surface）、Dupire局部波动率模型、主成分分析（PCA）情绪指标，以及基于两状态高斯隐马尔可夫模型（HMM）历史滚动训练的波动率机制分类模型，对美股主流指数（SPX、DJI、NDX）进行市场状态追踪与交易决策。
+这是一个企业级的量化研究与实盘显示看板。它利用期权隐含波动率曲面（Option Volatility Surface）、Dupire局部波动率模型、做市商 Gamma 暴露（GEX），以及基于两状态高斯隐马尔可夫模型（HMM）历史滚动训练的波动率机制分类模型，对美股主流指数（SPX、DJI、NDX）进行市场状态追踪与交易决策。
 
 ---
 
@@ -41,9 +41,9 @@ The system consists of interactive research walk-throughs in [research/](researc
   [vol_surface.py](vol_surface.py) ingests option chain data, computes implied volatilities across a dynamic Moneyness ($K/S$) and Tenor ($DTE$) grid, and implements a Dupire Local Volatility solver to resolve risk-neutral local volatilities. It is studied in [research/vol_surface_study.ipynb](research/vol_surface_study.ipynb).
   [vol_surface.py](vol_surface.py) 负责期权链数据的提取、隐含波动率表征，并在行权价偏离度（Moneyness, $K/S$）及到期期限（$DTE$）的双维网格上完成插值，同时配有 Dupire 局部波动率求解器。该部分的具体研究见 [research/vol_surface_study.ipynb](research/vol_surface_study.ipynb)。
 
-- **Principal Component Analysis (PCA) Vol Sentiment / 期权表面主成分分析与情绪量化**：
-  [surface_sentiment.py](surface_sentiment.py) reduces the dimensionality of daily volatility surface changes, extracting standard variance-ratio modes (PC1 Level shift, PC2 Twist, PC3 Skew/Slope) and translating surface deformations into a single interactive Compass Bull/Bear Gauge.
-  [surface_sentiment.py](surface_sentiment.py) 降维分析波动率曲面的每日动态德尔塔（Delta）移动，抓取主成分特征（如：PC1 整体平移、PC2 期限曲率或偏斜度），并结合 ATM 隐含波动率、偏斜（Skew）、期限结构斜率（Term Slope）转化为可交互的“罗盘（Compass）牛熊时速表”。
+- **Dealer Gamma Exposure (GEX) / 做市商 Gamma 暴露**：
+  [gex.py](gex.py) converts the live chain into dollar GEX per 1% spot move, sliced by TTM (0DTE / ≤7d / ≤14d / ≤30d / ≤45d / all). Call GEX is signed positive and put GEX negative under the standard dealer-short-to-public convention. The dashboard plots the per-strike profile plus net GEX, gamma flip, call wall, and put wall.
+  [gex.py](gex.py) 将期权链转为每 1% 现货变动的美元 GEX，并按到期窗口切片。看板上展示逐行权价分布、净 GEX、gamma flip、call wall 与 put wall。
 
 - **Markov Volatility Regime Filter / 隐马尔可夫波动率机制过滤器**：
   [volatility_regime.py](volatility_regime.py) implements rolling 2-state Gaussian Hidden Markov Models (HMM) to separate equity indexes into two practical regimes: "Low-vol / slow-bull" vs "High-vol / choppy". It is analyzed in [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb).
@@ -52,11 +52,11 @@ The system consists of interactive research walk-throughs in [research/](researc
 - **Live Production App / 实时看板应用**：
   [app.py](app.py) consolidates core calculations into a lightweight HTTP dashboard at `http://127.0.0.1:8050`. On startup it **preloads SPX, NDX, and DJI in parallel** (background workers + frontend polling). Each tab shows:
   - **3D vol surface** (Raw IV / Smooth IV / Arb-free Local Vol) on a transparent dark-theme canvas
-  - **Quant Sentiment Compass** (horizontal −100…+100 thermometer)
+  - **Dealer GEX** (TTM radios, per-strike call/put bars, flip / walls)
   - **HMM Signal Window** (candlesticks + close line, red high-vol regime shading, today marker)
   - **Sidebar:** HMM trade signal, VRP, term-structure roll spread, 1-sigma move table, DeepSeek-enhanced structure metrics, RV vs IV chart
 
-  [app.py](app.py) 汇总所有量化计算模块，暴露轻量 Web 看板（默认端口 `8050`）。**SPX / NDX / DJI 三个指数并行后台加载**，页面在未就绪前留白。各标签页包含：3D 波动率曲面（Raw / Smooth / Local Vol）、情绪罗盘、HMM 信号窗（K 线 + 高波红色 shading）、侧边栏机制信号、VRP、期限结构、1-sigma 目标位、DeepSeek 结构指标解读及 RV vs IV 图。
+  [app.py](app.py) 汇总所有量化计算模块，暴露轻量 Web 看板（默认端口 `8050`）。**SPX / NDX / DJI 三个指数并行后台加载**，页面在未就绪前留白。各标签页包含：3D 波动率曲面（Raw / Smooth / Local Vol）、分到期 GEX、HMM 信号窗（K 线 + 高波红色 shading）、侧边栏机制信号、VRP、期限结构、1-sigma 目标位、DeepSeek 结构指标解读及 RV vs IV 图。
 
   End-to-end workflow notebook: [trading_signal.ipynb](trading_signal.ipynb)
   完整研究/信号流程见 [trading_signal.ipynb](trading_signal.ipynb)
@@ -83,22 +83,17 @@ In [research/vol_surface_study.ipynb](research/vol_surface_study.ipynb), option 
 
 ---
 
-### 2. Option Delta PCA & Sentiment Speedometer / 期权 Delta 主成分分析与罗盘时速表
+### 2. Dealer Gamma Exposure (GEX) / 做市商 Gamma 暴露
 
-To extract actionable sentiment from multiple cross-sections of options, [surface_sentiment.py](surface_sentiment.py) runs PCA on daily volatility changes across different expiries and strikes.
-- **PC1 (Level Shift):** Captures general market panic or calmness.
-- **PC2 (Twist & Skew Slope):** Captures changes in near-term hedging premiums vs. far-term expectations.
+[gex.py](gex.py) estimates how much underlying dealers must trade to stay delta-neutral after a 1% spot move:
 
-By combining the principal scores with ATM skewness, term slope, and the base VIX level, a **Compass Sentiment Speedometer** is created. This scores market anxiety from **Bearish (-100)** to **Bullish (+100)**.
+$$
+\mathrm{GEX} = \Gamma \times \mathrm{OI} \times M \times S^{2} \times 0.01 \times \mathrm{sign}
+$$
 
-为了从庞杂的各档期权变动中提取交易情绪，[surface_sentiment.py](surface_sentiment.py) 针对波动率期限和行权价偏离度的动态位移矩阵运行 PCA：
-- **第一主成分 (PC1 - 水平平移):** 揭示整体市场避险情绪及恐慌程度。
-- **第二主成分 (PC2 - 扭转及偏斜斜率):** 揭示远近月对冲溢价与远期宏观预期的强弱转移。
+Calls are signed positive and puts negative. Positive net GEX: dealers long gamma (buy dips / sell rips). Negative: dealers short gamma (amplify the move). The live hub slices by TTM (0DTE, ≤7d, ≤14d, ≤30d, ≤45d, all) and plots the per-strike profile with gamma flip, call wall, and put wall.
 
-结合主成分特征得分、平价价差（ATM Skew）、到期期限结构斜率（Term Slope）以及 VIX level，计算出综合的 **罗盘情绪度量表（Compass Sentiment Speedometer）**，将市场当前情绪量化在 **极度看空 (-100)** 到 **极度看多 (+100)** 之间。
-
-#### Sentiment Gauge Speedometer / 罗盘时速仪表盘:
-![Compass Sentiment Gauge](demo/Compass.png)
+[gex.py](gex.py) 按到期窗口计算美元 GEX。正净 GEX 对应做市商多 gamma（抑制波动），负净 GEX 对应空 gamma（放大波动）。看板提供 gamma flip、call wall、put wall。
 
 ---
 
@@ -162,8 +157,8 @@ If you have a Futu OpenAPI subscription and intend to pull real-time cash option
 Open the notebooks inside [research/](research/) or the root workflow notebook to explore step-by-step:
 在 VS Code 内加载以下 Notebook 进行交互式研究：
 
-- **End-to-end signal workflow (surfaces + HMM + gauges):** [trading_signal.ipynb](trading_signal.ipynb)
-- **Volatility Surface & PCA Sentiment Study:** [research/vol_surface_study.ipynb](research/vol_surface_study.ipynb)
+- **End-to-end signal workflow (surfaces + HMM):** [trading_signal.ipynb](trading_signal.ipynb)
+- **Volatility Surface Study:** [research/vol_surface_study.ipynb](research/vol_surface_study.ipynb)
 - **HMM Walk-Forward Regime Transition Backtest:** [research/vol_regime_study.ipynb](research/vol_regime_study.ipynb)
 
 ### 2. Run Live Production Dashboard / 启动本地交互式看板

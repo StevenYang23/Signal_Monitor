@@ -33,25 +33,26 @@ from vol_surface import (  # noqa: E402
     VolSurfaceStudy,
     build_iv_grid,
     build_structure_metrics_insights,
-    classify_sentiment,
     compare_features,
     deepseek_enhance_structure_insights,
     detect_surface_anomalies,
     detect_term_hump,
     dupire_local_vol,
-    smooth_iv_grid_quadratic,
+    smooth_iv_grid_svi,
     fetch_anchor_iv_histories,
     fetch_spot_yfinance,
     fetch_vix_context,
 )
 from volatility_regime import HMMVolatilityRegime  # noqa: E402
+from gex import build_gex_report  # noqa: E402
+from ssr import atmf_skew_slope, fetch_es_futures, rolling_ssr, implied_ssr  # noqa: E402
 
 PORT = int(os.environ.get("PORT", 8050))
 USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "1").lower() not in ("0", "false", "no", "off")
-INDEX_NAMES = ("SPX", "NDX", "DJI")
-OPTION_MAP = {"SPX": "US..SPX", "NDX": "US..NDX", "DJI": "US.DIA"}
-SPOT_MAP = {"SPX": "^SPX", "NDX": "^NDX", "DJI": "^DJI"}
-HMM_MAP = {"SPX": "SPX", "NDX": "NSDQ", "DJI": "DJI"}
+INDEX_NAMES = ("SPX",)
+OPTION_MAP = {"SPX": "US..SPX"}
+SPOT_MAP = {"SPX": "^SPX"}
+HMM_MAP = {"SPX": "SPX"}
 
 
 def _futu_reachable(host: str = "127.0.0.1", port: int = 11111, timeout: float = 1.5) -> bool:
@@ -84,14 +85,12 @@ def _analyze_study(study: VolSurfaceStudy, *, futu_up: bool) -> dict:
         anchor_ctx = fetch_anchor_iv_histories(study.surfaces[today_d], study.cfg, query_time_period=1)
     else:
         anchor_ctx = {"anchors": {}, "series": pd.DataFrame(), "changes": {}, "meta": {"skipped": True}}
-    sentiment = classify_sentiment(today, changes, anomalies, vix_ctx, anchor_ctx)
     return {
         "today": today,
         "changes": changes,
         "anomalies": anomalies,
         "vix_context": vix_ctx,
         "anchor_context": anchor_ctx,
-        "sentiment": sentiment,
         "dates": dates,
     }
 
@@ -148,12 +147,12 @@ class QuantEngine:
         x_ks = [float(v) for v in g_ks[0, :]]
         y_dte = [float(v) for v in g_dte[:, 0]]
         iv_data = [[float(v) for v in row] for row in iv_g]
-        iv_g_smooth = smooth_iv_grid_quadratic(df_today, g_dte, g_ks, iv_g)
+        iv_g_smooth = smooth_iv_grid_svi(df_today, g_dte, g_ks, iv_g)
         local_vol_available = g_dte.shape[0] >= 2
         if local_vol_available:
-            lv = dupire_local_vol(option_spot, g_dte, g_ks, iv_g_smooth, r=cfg.risk_free_rate)
+            lv = dupire_local_vol(option_spot, g_dte, g_ks, iv_g, r=cfg.risk_free_rate)
         else:
-            lv = np.full_like(iv_g_smooth, np.nan)
+            lv = np.full_like(iv_g, np.nan)
             warnings_list.append("Local vol unavailable: live chain contains only one expiry.")
         lv_data = [[float(v) for v in row] for row in lv]
 
@@ -174,10 +173,10 @@ class QuantEngine:
                     # Find the closest grid point to this anchor
                     dte_idx = np.abs(g_dte[:, 0] - meta["dte"]).argmin()
                     ks_idx = np.abs(g_ks[0, :] - (meta["strike"] / spot)).argmin()
-                    iv_g_prev[dte_idx, ks_idx] -= chg / 100.0  # Convert vol pts to decimal
+                    iv_g_prev[dte_idx, ks_idx] -= chg  # chg is already in vol pts (e.g., 1.5 for 1.5%)
             
             # Smooth the reconstructed previous grid
-            iv_g_prev_smooth = smooth_iv_grid_quadratic(df_today, g_dte, g_ks, iv_g_prev)
+            iv_g_prev_smooth = smooth_iv_grid_svi(df_today, g_dte, g_ks, iv_g_prev)
             
             # Use the change in smoothed grids for anomaly detection
             iv_g_change = iv_g_smooth - iv_g_prev_smooth
@@ -205,13 +204,6 @@ class QuantEngine:
         kind_counts: dict[str, int] = {}
         for a in anomalies:
             kind_counts[a["kind"]] = kind_counts.get(a["kind"], 0) + 1
-
-        # Surface-delta PCA needs many daily full surfaces. This dashboard is live-only,
-        # so PCA is skipped; structure insights use anchor IV histories instead.
-        pca_score_history = None
-        today_scores = [0.0, 0.0, 0.0, 0.0]
-        sentiment = {"joint_flags": [], "z_scores": []}
-        print(f"[pipeline] {short_name} PCA skipped: live-only mode (no multi-day surface cache).", flush=True)
 
         vix = float(result.get("vix_context", {}).get("vix", 15.0))
         aiv = float(today_f.get("atm_iv_30d", np.nan))
@@ -245,33 +237,20 @@ class QuantEngine:
             except (TypeError, ValueError):
                 pass
 
-        ps_score = np.clip(-psk * 4.0, -35, 35)
-        ts_score = np.clip(tsl * 5.0, -25, 25)
-        vix_score = np.clip((20.0 - vix) * 2.0, -20, 20)
-        vrp_score = np.clip((6.0 - vrp_val) * 2.5, -15, 15)
-        anchor_score = np.clip(-skew_proxy_chg * 5.0, -10, 10)
-        sentiment_score = float(np.clip(ps_score + ts_score + vix_score + vrp_score + anchor_score, -100, 100))
-
-        structure_metrics = build_structure_metrics_insights(
-            today=today_f,
-            vix_ctx=result.get("vix_context"),
-            anchor_ctx=anchor_ctx,
-            today_scores=today_scores,
-            pca_sentiment=sentiment,
-            pca_score_history=pca_score_history,
-            changes=result.get("changes"),
-        )
-        if USE_DEEPSEEK:
-            structure_metrics = deepseek_enhance_structure_insights(
-                structure_metrics,
-                context={
-                    "index": short_name,
-                    "date": str(today_d),
-                    "spot": spot,
-                    "term_slope": tsl,
-                    "vrp": vrp_val,
-                },
+        gex_payload: dict = {"exists": False, "buckets": {}}
+        try:
+            gex_df = study.gex_chains.get(today_d)
+            if gex_df is None or gex_df.empty:
+                gex_df = df_today
+            gex_payload = build_gex_report(gex_df, spot=spot, r=cfg.risk_free_rate)
+            print(
+                f"[pipeline] {short_name} GEX {gex_payload.get('n_contracts', 0)} contracts, "
+                f"net {gex_payload.get('buckets', {}).get(gex_payload.get('default_bucket', '0'), {}).get('net_label', 'n/a')}",
+                flush=True,
             )
+        except Exception as gex_exc:
+            warnings_list.append(f"GEX skipped: {gex_exc}")
+            print(f"[pipeline] {short_name} GEX: {gex_exc}", flush=True)
 
         hmm_regime_str = "unknown"
         hmm_prob_today = 50.0
@@ -357,6 +336,52 @@ class QuantEngine:
             warnings_list.append(msg)
             print(f"[pipeline] {short_name} HMM: {hmm_exc}", flush=True)
 
+        
+        # Calculate SSR
+        realized_ssr = np.nan
+        implied_ssr_val = np.nan
+        try:
+            es, _ = fetch_es_futures(lookback_days=90)
+            fut = es["close"]
+            if hmm_history_dates and hmm_history_iv:
+                iv_series = pd.Series(hmm_history_iv, index=pd.to_datetime(hmm_history_dates))
+                iv_series.index = iv_series.index.tz_localize(None).normalize()
+                slope = atmf_skew_slope(aiv, psk, dte=30)
+                ssr_df = rolling_ssr(fut, iv_series, slope, window=10)
+                if not ssr_df.empty:
+                    realized_ssr = float(ssr_df.dropna(subset=["ssr"]).iloc[-1].ssr)
+            
+            imp = implied_ssr(x_ks, y_dte, sv_data, min_dte=14.0)
+            if not imp.empty and not imp["ssr"].dropna().empty:
+                implied_ssr_val = float(np.interp(30.0, imp["dte"], imp["ssr"]))
+        except Exception as ssr_exc:
+            print(f"[pipeline] {short_name} SSR: {ssr_exc}", flush=True)
+
+        structure_metrics = build_structure_metrics_insights(
+            today=today_f,
+            vix_ctx=result.get("vix_context"),
+            anchor_ctx=anchor_ctx,
+            changes=result.get("changes"),
+        )
+        if USE_DEEPSEEK:
+            structure_metrics = deepseek_enhance_structure_insights(
+                structure_metrics,
+                context={
+                    "index": short_name,
+                    "date": str(today_d),
+                    "spot": spot,
+                    "term_slope": tsl,
+                    "vrp": vrp_val,
+                    "hmm_regime": hmm_regime_str,
+                    "hmm_prob_today": hmm_prob_today,
+                    "realized_ssr": realized_ssr,
+                    "implied_ssr": implied_ssr_val,
+                    "gex_net_label": gex_payload.get("buckets", {}).get(gex_payload.get("default_bucket", "0"), {}).get("net_label", "n/a"),
+                    "gex_regime": gex_payload.get("buckets", {}).get(gex_payload.get("default_bucket", "0"), {}).get("regime", "unknown"),
+                    "anomalies_count": len(anomalies)
+                },
+            )
+        
         return {
             "exists": True,
             "warnings": warnings_list,
@@ -370,10 +395,8 @@ class QuantEngine:
             "bfly": bfly,
             "d_bfly": d_bfly,
             "vrp": vrp_val,
-            "pc1": today_scores[0],
-            "pc2": today_scores[1],
-            "score": round(sentiment_score, 1),
             "structure_metrics": structure_metrics,
+            "gex": gex_payload,
             "surface_x": x_ks,
             "surface_y": y_dte,
             "surface_z": iv_data,
@@ -538,14 +561,17 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 .panel{background:#131722;border-radius:8px;border:1px solid #1f2330;overflow:hidden;display:flex;flex-direction:column}
 .ptitle{font-size:11px;font-weight:600;padding:10px 16px;border-bottom:1px solid #1f2330;color:#8f96a3;text-transform:uppercase;letter-spacing:.8px}
 .surface-panel{flex:1.4;display:flex;flex-direction:column;min-height:400px}
+.surface-label{font-size:10px;font-weight:600;padding:8px 16px 0;color:#8f96a3;text-transform:uppercase;letter-spacing:.6px}
+.surface-plot{width:100%;height:340px;min-height:340px;background:transparent!important}
 .left-col{flex:1.2;display:flex;flex-direction:column;gap:16px;height:100%;overflow-y:auto;padding-right:4px}
 .price-regime-panel{flex:1;display:flex;flex-direction:column;min-height:520px}
 .sidebar{flex:0.8;display:flex;flex-direction:column;gap:16px;overflow-y:auto;padding-right:4px}
 .controls{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid #1f2330;align-items:center}
 .controls label{font-size:11px;color:#8f96a3;font-weight:500}
 .rg{display:flex;gap:2px;background:#1a1f2c;border-radius:6px;padding:2px}
-.rb{padding:4px 12px;border-radius:4px;font-size:11px;cursor:pointer;border:none;background:transparent;color:#8f96a3;font-weight:600;transition:all .15s}
+.rb{padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer;border:none;background:transparent;color:#8f96a3;font-weight:600;transition:all .15s}
 .rb.active{background:#2a6cff;color:#fff}
+#gexBucketBtns{flex-wrap:wrap;row-gap:2px}
 .dashboard-grid{display:grid;grid-template-columns:1fr;gap:10px;padding:16px}
 .metric-card{background:#181d2e;border-radius:6px;border:1px solid #232a3f;padding:10px;display:flex;flex-direction:column;justify-content:center}
 .metric-card .label{font-size:9px;color:#8f96a3;text-transform:uppercase;font-weight:600;margin-bottom:3px}
@@ -575,6 +601,9 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 .loading-overlay .title{color:#e8eaed;font-size:15px;font-weight:600;margin-bottom:8px}
 .loading-overlay .hint{font-size:12px;line-height:1.6;max-width:380px}
 .loading-overlay .elapsed{font-size:11px;color:#2a6cff;margin-top:12px;font-variant-numeric:tabular-nums}
+.gex-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:8px 16px;border-bottom:1px solid #1f2330}
+.gex-stat .glabel{font-size:9px;color:#8f96a3;text-transform:uppercase;font-weight:600}
+.gex-stat .gval{font-size:13px;font-weight:700;color:#e8eaed;margin-top:2px}
 .error-box{padding:40px;text-align:center;color:#e74c3c;font-weight:600}
 .blank-hint{color:#8f96a3;font-size:12px;text-align:center;padding:24px}
 .anomaly-row{margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #1c2030}
@@ -587,11 +616,7 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 <body>
 <div class="header">
   <h1>Index Quant Signal Hub</h1>
-  <div class="header-tabs">
-    <button class="tab-btn active" data-idx="SPX" onclick="switchIndex('SPX')">SPX</button>
-    <button class="tab-btn" data-idx="NDX" onclick="switchIndex('NDX')">NDX</button>
-    <button class="tab-btn" data-idx="DJI" onclick="switchIndex('DJI')">DJI</button>
-  </div>
+  <span class="badge">SPX</span>
   <button class="refresh-btn" id="refreshBtn" onclick="refreshCurrent()">Refresh</button>
   <span id="statusBadge" class="badge">Ready</span>
   <span id="warnBadge" class="badge" style="display:none;background:#3d2a1a;color:#e67e22;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
@@ -602,18 +627,18 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 <div class="main-layout">
   <div class="left-col">
     <div class="panel surface-panel">
-      <div class="ptitle" id="surfaceTitle">Vol Surface - SPX</div>
-      <div class="controls" id="surfaceModeControls">
-        <label>Mode:</label>
-        <div class="rg">
+      <div class="ptitle" id="surfaceTitle" style="display:flex; justify-content:space-between; align-items:center;">
+        <span>Vol Surface - SPX</span>
+        <div class="rg" style="margin-top:-4px; margin-bottom:-4px;">
           <button class="rb active" id="btnRawIV" onclick="setMode('iv')">Raw IV</button>
           <button class="rb" id="btnSmoothIV" onclick="setMode('sv')">Smooth IV</button>
-          <button class="rb" id="btnLV" onclick="setMode('lv')">Arb-free Local Vol</button>
+          <button class="rb" id="btnLV" onclick="setMode('lv')">Local Vol</button>
+          <button class="rb" id="btnAnomaly" onclick="setMode('anomaly')">Anomaly</button>
         </div>
-        <span style="font-size:10px;color:#8f96a3;margin-left:8px" id="surfaceModeHint"></span>
       </div>
-      <div class="plot-wrap" style="background:transparent">
-        <div id="surfacePlot" class="plot-target" style="background:transparent"></div>
+      <div class="plot-wrap" style="background:transparent;flex:1;min-height:340px;display:flex;flex-direction:column;">
+        <div id="surfacePlot" class="plot-target" style="flex:1;"></div>
+        <div id="surfaceAnomalyBox" class="summary-content" style="display:none; flex:1;"></div>
         <div class="loading-overlay hidden" id="surfaceLoader">
           <div class="title">Loading SPX…</div>
           <div class="hint">Fetching options via Futu OpenD (127.0.0.1:11111).<br>First load may take 1–3 minutes.</div>
@@ -622,9 +647,24 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
       </div>
     </div>
 
-    <div class="panel" style="flex:0 0 auto;padding:12px 16px">
-      <div class="ptitle" style="padding:0 0 10px;border-bottom:none">Quant Sentiment Compass</div>
-      <div id="horizontalCompassContainer" style="min-height:52px;margin-top:4px"></div>
+    <div class="panel" style="flex:0 0 auto;min-height:440px">
+      <div class="ptitle" id="gexTitle">Dealer Gamma Exposure (GEX)</div>
+      <div class="controls" id="gexTtmControls">
+        <label>TTM:</label>
+        <div class="rg" id="gexBucketBtns"></div>
+        <span style="font-size:10px;color:#8f96a3;margin-left:8px" id="gexHint">TTM 0–5 BD. OI is T-1. Calls + / puts −.</span>
+      </div>
+      <div class="gex-stats" style="grid-template-columns:repeat(6,1fr);">
+        <div class="gex-stat"><div class="glabel">Net GEX</div><div class="gval" id="gexNetVal">--</div></div>
+        <div class="gex-stat"><div class="glabel">Gamma Flip</div><div class="gval" id="gexFlipVal">--</div></div>
+        <div class="gex-stat"><div class="glabel">Call Wall</div><div class="gval" id="gexCallWallVal">--</div></div>
+        <div class="gex-stat"><div class="glabel">Put Wall</div><div class="gval" id="gexPutWallVal">--</div></div>
+        <div class="gex-stat"><div class="glabel">Realized SSR</div><div class="gval" id="realizedSsrVal">--</div></div>
+        <div class="gex-stat"><div class="glabel">Implied SSR</div><div class="gval" id="impliedSsrVal">--</div></div>
+      </div>
+      <div class="plot-wrap" style="min-height:340px">
+        <div id="gexPlot" class="plot-target" style="min-height:340px"></div>
+      </div>
     </div>
 
     <div class="panel price-regime-panel">
@@ -637,7 +677,7 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
 
   <div class="sidebar">
     <div class="panel" style="flex-shrink:0">
-      <div class="ptitle">Regime & Sentiment</div>
+      <div class="ptitle">Regime</div>
       <div class="dashboard-grid">
         <div class="hmm-indicator inactive" id="hmmModeCard">
           <div style="font-size:9px;text-transform:uppercase;font-weight:600;opacity:.8">HMM Trading Signal</div>
@@ -655,6 +695,18 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
       </div>
     </div>
 
+    <div class="panel" style="flex:1;min-height:200px">
+      <div class="ptitle">Quantitative Structure Metrics</div>
+      <div class="summary-content" id="bulletsBox"></div>
+    </div>
+
+    <div class="panel" style="flex:0 0 auto;min-height:240px">
+      <div class="ptitle">Volatility Historical Shading (RV vs IV)</div>
+      <div class="plot-wrap" style="min-height:220px">
+        <div id="volPlot" class="plot-target" style="min-height:220px"></div>
+      </div>
+    </div>
+
     <div class="panel condor-panel">
       <div class="ptitle">1-Sigma Vol Move Targets</div>
       <div class="condor-scroll">
@@ -668,30 +720,14 @@ body{background:#0e1118;color:#d0d4dc;font-family:-apple-system,BlinkMacSystemFo
         </table>
       </div>
     </div>
-
-    <div class="panel" style="flex:1;min-height:200px">
-      <div class="ptitle">Quantitative Structure Metrics</div>
-      <div class="summary-content" id="bulletsBox"></div>
-    </div>
-
-    <div class="panel" style="flex:1;min-height:200px">
-      <div class="ptitle">Surface Anomaly List <span id="anomalyCountBadge" style="color:#2a6cff;font-weight:700"></span></div>
-      <div class="summary-content" id="anomalyBox"></div>
-    </div>
-
-    <div class="panel" style="flex:0 0 auto;min-height:240px">
-      <div class="ptitle">Volatility Historical Shading (RV vs IV)</div>
-      <div class="plot-wrap" style="min-height:220px">
-        <div id="volPlot" class="plot-target" style="min-height:220px"></div>
-      </div>
-    </div>
   </div>
 </div>
 
 <script>
-const ALL = ['SPX','NDX','DJI'];
+const ALL = ['SPX'];
 let currentIdx = 'SPX';
 let currentMode = 'iv';
+let currentGexBucket = '0';
 let cache = {};
 let loadJobs = {};
 
@@ -715,23 +751,28 @@ function showLoader(show, idx){
 function showBlankState(){
   $('dateBadge').textContent = '--';
   $('spotBadge').textContent = currentIdx + ': --';
-  $('surfaceTitle').textContent = 'Vol Surface - ' + currentIdx;
+  $('surfaceTitle').querySelector('span').textContent = 'Vol Surface - ' + currentIdx;
   $('regimeTitle').textContent = 'HMM Signal Window - ' + currentIdx;
   if (typeof Plotly !== 'undefined') {
-    ['surfacePlot','regimePlot','volPlot'].forEach(id => {
+    ['surfacePlot','regimePlot','volPlot','gexPlot'].forEach(id => {
       const el = $(id);
       if (el) Plotly.purge(el);
     });
   }
-  $('horizontalCompassContainer').innerHTML = '';
+  $('gexNetVal').textContent = '--';
+  $('gexFlipVal').textContent = '--';
+  $('gexCallWallVal').textContent = '--';
+  $('gexPutWallVal').textContent = '--';
+  $('realizedSsrVal').textContent = '--';
+  $('impliedSsrVal').textContent = '--';
+  $('gexBucketBtns').innerHTML = '';
   $('vraVal').textContent = '--';
   $('tslVal').textContent = '--';
   $('hmmSignalVal').textContent = '--';
   $('hmmProbVal').textContent = '--';
   $('hmmModeCard').className = 'hmm-indicator inactive';
   $('bulletsBox').innerHTML = '';
-  $('anomalyBox').innerHTML = '';
-  $('anomalyCountBadge').textContent = '';
+  if ($('surfaceAnomalyBox')) $('surfaceAnomalyBox').innerHTML = '';
   $('condorTableBody').innerHTML = '<tr><td colspan="4" style="text-align:center;color:#8f96a3">--</td></tr>';
   $('warnBadge').style.display = 'none';
   showLoader(false);
@@ -808,20 +849,163 @@ async function preloadAllIndices(force){
   await Promise.all(ALL.map(idx => pollIndexInBackground(idx, force)));
 }
 
-function getScoreLabel(score){
-  if (score > 50) return 'Extremely Bullish';
-  if (score > 15) return 'Slightly Bullish';
-  if (score > -15) return 'Neutral';
-  if (score > -50) return 'Slightly Bearish';
-  return 'Extremely Bearish';
+function fmtGexStrike(v){
+  if (v == null || !isFinite(Number(v))) return '--';
+  return Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+function setGexBucket(key){
+  currentGexBucket = key;
+  const data = cache[currentIdx];
+  if (data && data.exists) {
+    renderGexPanel(data);
+  }
+}
+
+function renderGexBucketButtons(gex){
+  const host = $('gexBucketBtns');
+  if (!host) return;
+  host.innerHTML = '';
+  const buckets = (gex && gex.buckets) || {};
+  const order = (gex && gex.bucket_order) || Object.keys(buckets);
+  order.forEach(k => {
+    const b = buckets[k];
+    if (!b) return;
+    const btn = document.createElement('button');
+    btn.className = 'rb' + (k === currentGexBucket ? ' active' : '');
+    btn.textContent = b.label;
+    btn.onclick = () => setGexBucket(k);
+    host.appendChild(btn);
+  });
+}
+
+function renderGexPanel(data){
+  const gex = data.gex || {};
+  $('gexTitle').textContent = 'Dealer Gamma Exposure (GEX) - ' + currentIdx;
+  if (!gex.exists || !gex.buckets) {
+    renderGexBucketButtons(null);
+    $('gexNetVal').textContent = '--';
+    $('gexFlipVal').textContent = '--';
+    $('gexCallWallVal').textContent = '--';
+    $('gexPutWallVal').textContent = '--';
+    $('gexPlot').innerHTML = '<div class="blank-hint">GEX unavailable for this session.</div>';
+    return;
+  }
+  if (!gex.buckets[currentGexBucket]) {
+    currentGexBucket = gex.default_bucket || '0';
+  }
+  renderGexBucketButtons(gex);
+  const b = gex.buckets[currentGexBucket];
+  const netColor = b.net > 0 ? '#00cc66' : (b.net < 0 ? '#e74c3c' : '#e8eaed');
+  const regime = b.regime === 'long_gamma' ? ' long' : (b.regime === 'short_gamma' ? ' short' : '');
+  $('gexNetVal').textContent = (b.net_label || '--') + regime;
+  $('gexNetVal').style.color = netColor;
+  $('gexFlipVal').textContent = fmtGexStrike(b.flip);
+  $('gexCallWallVal').textContent = fmtGexStrike(b.call_wall);
+  $('gexPutWallVal').textContent = fmtGexStrike(b.put_wall);
+  $('realizedSsrVal').textContent = Number.isFinite(data.realized_ssr) ? Number(data.realized_ssr).toFixed(2) : '--';
+  $('impliedSsrVal').textContent = Number.isFinite(data.implied_ssr) ? Number(data.implied_ssr).toFixed(2) : '--';
+  let hint = (b.n_contracts || 0) + ' contracts';
+  if (b.expiry) hint += ' · expiry ' + b.expiry;
+  if (b.ttm_actual != null) hint += ' · ' + b.ttm_actual + ' BD';
+  hint += ' · OI is T-1 · calls + / puts −';
+  $('gexHint').textContent = hint;
+
+  const strikes = (b.strikes || []).map(Number);
+  if (!strikes.length) {
+    if (typeof Plotly !== 'undefined') Plotly.purge($('gexPlot'));
+    $('gexPlot').innerHTML = '<div class="blank-hint">No GEX in this TTM bucket.</div>';
+    return;
+  }
+  const toB = v => Number(v) / 1e9;
+  const call = (b.call_gex || []).map(toB);
+  const put = (b.put_gex || []).map(toB);
+  const cum = (b.cum_gex && b.cum_gex.length === strikes.length)
+    ? b.cum_gex.map(toB)
+    : (b.net_gex || []).reduce((acc, v) => { acc.push((acc.length ? acc[acc.length-1] : 0) + toB(v)); return acc; }, []);
+
+  const spot = Number(data.spot != null ? data.spot : gex.spot);
+  const pad = Math.max(spot * 0.035, 150);
+  let x0 = spot - pad, x1 = spot + pad;
+  [b.call_wall, b.put_wall, b.flip].forEach(v => {
+    if (v == null || !isFinite(Number(v))) return;
+    x0 = Math.min(x0, Number(v) - 40);
+    x1 = Math.max(x1, Number(v) + 40);
+  });
+
+  const vis = i => strikes[i] >= x0 && strikes[i] <= x1;
+  const mag = Math.max(0.01, ...call.filter((_, i) => vis(i)).map(Math.abs),
+                             ...put.filter((_, i) => vis(i)).map(Math.abs));
+  const cumMag = Math.max(0.01, ...cum.filter((_, i) => vis(i)).map(Math.abs));
+
+  const traces = [
+    { type: 'bar', x: strikes, y: put, name: 'Put GEX', marker: { color: '#e74c3c' },
+      hovertemplate: 'K %{x:.0f}<br>Put %{y:.2f}B<extra></extra>' },
+    { type: 'bar', x: strikes, y: call, name: 'Call GEX', marker: { color: '#27ae60' },
+      hovertemplate: 'K %{x:.0f}<br>Call %{y:.2f}B<extra></extra>' },
+    { type: 'scatter', mode: 'lines', x: strikes, y: cum, name: 'Agg GEX',
+      line: { color: '#5dade2', width: 2.5 }, yaxis: 'y2',
+      hovertemplate: 'K %{x:.0f}<br>Agg %{y:.2f}B<extra></extra>' },
+  ];
+  const shapes = [];
+  const annotations = [];
+  if (isFinite(spot)) {
+    shapes.push({ type: 'line', xref: 'x', yref: 'paper', x0: spot, x1: spot, y0: 0, y1: 1,
+      line: { color: '#e8eaed', width: 1.5, dash: 'dash' } });
+    annotations.push({ x: spot, y: 1, yref: 'paper', text: 'Spot ' + spot.toFixed(0),
+      showarrow: false, font: { color: '#e8eaed', size: 10 }, yshift: -12, xanchor: 'left' });
+  }
+  if (b.flip != null) {
+    shapes.push({ type: 'line', xref: 'x', yref: 'paper', x0: b.flip, x1: b.flip, y0: 0, y1: 1,
+      line: { color: '#e67e22', width: 1.5 } });
+    annotations.push({ x: b.flip, y: 1, yref: 'paper', text: 'Flip',
+      showarrow: false, font: { color: '#e67e22', size: 10 }, yshift: -8 });
+  }
+  if (b.call_wall != null) {
+    annotations.push({ x: b.call_wall, y: 0, yref: 'paper',
+      text: 'Call wall ' + Number(b.call_wall).toFixed(0),
+      showarrow: false, font: { color: '#27ae60', size: 10 }, yshift: 12, xanchor: 'left' });
+  }
+  if (b.put_wall != null) {
+    annotations.push({ x: b.put_wall, y: 0, yref: 'paper',
+      text: 'Put wall ' + Number(b.put_wall).toFixed(0),
+      showarrow: false, font: { color: '#e74c3c', size: 10 }, yshift: -12, xanchor: 'right' });
+  }
+
+  Plotly.react('gexPlot', traces, {
+    barmode: 'relative',
+    bargap: 0.12,
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(0,0,0,0)',
+    margin: { l: 52, r: 52, t: 16, b: 64 },
+    legend: { orientation: 'h', y: -0.22, yanchor: 'top', x: 0, font: { color: '#8f96a3', size: 10 } },
+    xaxis: {
+      title: 'Strike', range: [x0, x1], gridcolor: '#1f2330',
+      tickfont: { color: '#8f96a3', size: 10 }, titlefont: { color: '#8f96a3', size: 11 },
+    },
+    yaxis: {
+      title: 'GEX ($B / 1%)', range: [-mag * 1.2, mag * 1.2],
+      gridcolor: '#1f2330', zeroline: true, zerolinecolor: '#8f96a3',
+      tickfont: { color: '#8f96a3', size: 10 }, titlefont: { color: '#8f96a3', size: 11 },
+    },
+    yaxis2: {
+      title: 'Agg GEX ($B)', overlaying: 'y', side: 'right', showgrid: false,
+      range: [-cumMag * 1.15, cumMag * 1.15],
+      tickfont: { color: '#5dade2', size: 10 }, titlefont: { color: '#5dade2', size: 11 },
+      zeroline: false,
+    },
+    shapes: shapes,
+    annotations: annotations,
+    height: 380,
+  }, { displayModeBar: false, responsive: true });
 }
 
 function renderAnomalies(data) {
-  const box = $('anomalyBox');
+  const box = $('surfaceAnomalyBox');
+  if (!box) return;
   const rows = data.anomalies || [];
-  $('anomalyCountBadge').textContent = rows.length ? '(' + rows.length + ')' : '';
   if (!rows.length) {
-    box.innerHTML = '<div style="color:#8f96a3;font-size:12px">No surface anomalies flagged on this session.</div>';
+    box.innerHTML = '<div style="color:#8f96a3;font-size:12px;padding:16px;">No surface anomalies flagged on this session.</div>';
     return;
   }
   box.innerHTML = '';
@@ -865,24 +1049,13 @@ function buildHighVolShapes(dates, regimes) {
   return shapes;
 }
 
-function anomalyMarkers(data, mode) {
-  const rows = (data.anomalies || []).filter(a => {
-    if (a.ks == null || a.dte == null) return false;
-    if (mode === 'lv') return a.surface === 'lv' || a.surface === 'structure';
-    return a.surface === 'iv' || a.surface === 'structure';
-  });
+function anomalyMarkers(data) {
+  const rows = (data.anomalies || []).filter(a => a.ks != null && a.dte != null && a.surface === 'iv');
   if (!rows.length) return null;
   
   // To align the markers with the surface, we need to map the K/S and DTE back to the grid indices
   // and use the actual Z value from the surface at that point.
-  let zData;
-  if (mode === 'iv') {
-    zData = data.surface_z;
-  } else if (mode === 'sv') {
-    zData = data.surface_sv || data.surface_z;
-  } else {
-    zData = data.surface_w;
-  }
+  let zData = data.surface_z;
 
   const zVals = rows.map(a => {
     // Find the closest grid point
@@ -914,65 +1087,52 @@ function anomalyMarkers(data, mode) {
   return {
     type: 'scatter3d',
     mode: 'markers',
-    x: rows.map(a => a.ks),
+    x: rows.map(a => Math.log(a.ks)),
     y: rows.map(a => a.dte),
     z: zVals,
     marker: { size: 5, color: '#ff4d4f', symbol: 'diamond', line: { width: 1, color: '#fff' } },
     text: rows.map(a => a.kind + ': ' + a.detail),
-    hovertemplate: '%{text}<br>K/S: %{x:.2f}<br>DTE: %{y:.0f}<extra></extra>',
+    hovertemplate: '%{text}<br>Log(K/S): %{x:.2f}<br>DTE: %{y:.0f}<extra></extra>',
     name: 'Anomalies',
   };
 }
 
-function renderSurfacePanel(data, idx) {
-  let z, title, colorscale;
-  if (currentMode === 'iv') {
-    z = data.surface_z; title = 'Raw Implied Vol (%)'; colorscale = 'Viridis';
-  } else if (currentMode === 'sv') {
-    z = data.surface_sv || data.surface_z; title = 'Smooth Implied Vol (%)'; colorscale = 'Cividis';
-  } else {
-    if (!data.local_vol_available) {
-      $('surfacePlot').innerHTML = '<div class="error-box">Local volatility requires at least two live expiries.</div>';
-      return;
-    }
-    z = data.surface_w; title = 'Local Vol (%)'; colorscale = 'Magma';
-  }
-  const zFlat = z.flat();
-  const zMax = zFlat.length ? Math.max.apply(null, zFlat) : 100;
-  const rng = currentMode === 'lv' ? [0, zMax] : undefined;
+function drawOneSurface(elId, data, idx, z, title, colorscale, withMarks, zRange) {
   const singleExpiry = data.surface_y.length === 1;
   const traces = [];
+  const logX = data.surface_x.map(Math.log);
   if (singleExpiry) {
     traces.push({
       type: 'scatter3d',
       mode: 'lines+markers',
-      x: data.surface_x,
+      x: logX,
       y: data.surface_x.map(() => data.surface_y[0]),
       z: z[0],
       line: { color: '#2a6cff', width: 6 },
       marker: { color: z[0], colorscale: colorscale, size: 4, colorbar: { title: title } },
-      hovertemplate: 'K/S: %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
+      hovertemplate: 'Log(K/S): %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
     });
   } else {
     traces.push({
       type: 'surface',
-      x: data.surface_x, y: data.surface_y, z: z,
+      x: logX, y: data.surface_y, z: z,
       colorscale: colorscale,
-      hovertemplate: 'K/S: %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
+      hovertemplate: 'Log(K/S): %{x:.2f}<br>DTE: %{y:.0f}d<br>Vol: %{z:.1f}%<extra></extra>',
       colorbar: { title: title, titleside: 'right', x: 0.92, len: 0.7, bgcolor: 'rgba(0,0,0,0)', tickfont: { color: '#8f96a3' }, titlefont: { color: '#8f96a3' } },
       contours: { z: { show: true, usecolormap: true, highlightcolor: 'lime', project: { z: true } } },
-      cmin: rng ? rng[0] : undefined, cmax: rng ? rng[1] : undefined,
+      cmin: zRange ? zRange[0] : undefined, cmax: zRange ? zRange[1] : undefined,
     });
   }
-  const marks = anomalyMarkers(data, currentMode);
-  if (marks) traces.push(marks);
-
-  Plotly.react('surfacePlot', traces, {
+  if (withMarks) {
+    const marks = anomalyMarkers(data);
+    if (marks) traces.push(marks);
+  }
+  Plotly.react(elId, traces, {
     margin: { l: 0, r: 0, t: 0, b: 0 },
     paper_bgcolor: 'rgba(0,0,0,0)',
     plot_bgcolor: 'rgba(0,0,0,0)',
     scene: {
-      xaxis: { title: { text: 'Moneyness (K/S)', font: { color: '#8f96a3' } }, gridcolor: '#222a3d', tickfont: { color: '#8f96a3' }, backgroundcolor: 'rgba(0,0,0,0)' },
+      xaxis: { title: { text: 'Log Moneyness ln(K/S)', font: { color: '#8f96a3' } }, gridcolor: '#222a3d', tickfont: { color: '#8f96a3' }, backgroundcolor: 'rgba(0,0,0,0)' },
       yaxis: { title: { text: 'DTE', font: { color: '#8f96a3' } }, gridcolor: '#222a3d', tickfont: { color: '#8f96a3' }, backgroundcolor: 'rgba(0,0,0,0)' },
       zaxis: { title: { text: title, font: { color: '#8f96a3' } }, gridcolor: '#222a3d', tickfont: { color: '#8f96a3' }, backgroundcolor: 'rgba(0,0,0,0)' },
       camera: { eye: { x: -1.5, y: -1.5, z: 0.8 } },
@@ -980,8 +1140,29 @@ function renderSurfacePanel(data, idx) {
       bgcolor: 'rgba(0,0,0,0)',
     },
     hoverlabel: { bgcolor: '#1c2030', font: { size: 12 } },
-    uirevision: 'surface-' + idx + '-' + currentMode,
+    uirevision: 'surface-' + idx + '-' + elId,
   }, { displayModeBar: false, responsive: true });
+}
+
+function renderSurfacePanel(data, idx) {
+  if (currentMode === 'anomaly') return;
+
+  let z, title, colorscale, zRange;
+  if (currentMode === 'iv') {
+    z = data.surface_z; title = 'Raw Implied Vol (%)'; colorscale = 'Viridis';
+  } else if (currentMode === 'sv') {
+    z = data.surface_sv || data.surface_z; title = 'SVI Smooth IV (%)'; colorscale = 'Cividis';
+  } else {
+    if (!data.local_vol_available) {
+      $('surfacePlot').innerHTML = '<div class="error-box">Local volatility requires at least two live expiries.</div>';
+      return;
+    }
+    z = data.surface_w; title = 'Local Vol (%)'; colorscale = 'Magma';
+    const zFlat = z.flat();
+    const zMax = zFlat.length ? Math.max.apply(null, zFlat) : 100;
+    zRange = [0, zMax];
+  }
+  drawOneSurface('surfacePlot', data, idx, z, title, colorscale, currentMode === 'iv', zRange);
 }
 
 function renderRegimePanel(data, idx) {
@@ -1089,29 +1270,9 @@ function renderAll(){
 
   $('dateBadge').textContent = 'Date: ' + data.date;
   $('spotBadge').textContent = currentIdx + ': ' + Number(data.spot).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-  $('surfaceTitle').textContent = 'Vol Surface - ' + currentIdx;
+  $('surfaceTitle').querySelector('span').textContent = 'Vol Surface - ' + currentIdx;
   renderSurfacePanel(data, currentIdx);
-
-  const score = data.score;
-  const compassPct = ((score + 100) / 200) * 100;
-  let scoreColor = '#f1c40f';
-  if (score > 50) scoreColor = '#27ae60';
-  else if (score > 15) scoreColor = '#2ecc71';
-  else if (score < -50) scoreColor = '#e74c3c';
-  else if (score < -15) scoreColor = '#e67e22';
-
-  $('horizontalCompassContainer').innerHTML = `
-    <div style="position:relative;width:100%;padding-top:20px">
-      <div style="display:flex;justify-content:space-between;font-size:10px;color:#8f96a3;margin-bottom:6px;font-weight:500">
-        <span>Extremely Bearish (-100)</span><span>Neutral (0)</span><span>Extremely Bullish (100)</span>
-      </div>
-      <div style="position:relative;height:16px;background:linear-gradient(90deg,#e74c3c 0%,#e67e22 25%,#f1c40f 50%,#2ecc71 75%,#27ae60 100%);border-radius:8px">
-        <div style="position:absolute;top:-3px;left:${compassPct}%;width:6px;height:22px;background:#fff;border-radius:3px;transform:translateX(-50%)"></div>
-        <div style="position:absolute;top:-34px;left:${compassPct}%;background:#2a6cff;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;transform:translateX(-50%);white-space:nowrap">
-          Score: ${score >= 0 ? '+' : ''}${score}/100 (<span style="color:${scoreColor}">${getScoreLabel(score)}</span>)
-        </div>
-      </div>
-    </div>`;
+  renderGexPanel(data);
 
   $('vraVal').textContent = Number(data.vrp).toFixed(1) + ' pts';
   $('tslVal').textContent = Number(data.tsl).toFixed(1) + ' vol pts';
@@ -1182,6 +1343,15 @@ function setMode(mode){
   $('btnRawIV').className = 'rb' + (mode === 'iv' ? ' active' : '');
   $('btnSmoothIV').className = 'rb' + (mode === 'sv' ? ' active' : '');
   $('btnLV').className = 'rb' + (mode === 'lv' ? ' active' : '');
+  $('btnAnomaly').className = 'rb' + (mode === 'anomaly' ? ' active' : '');
+  
+  if (mode === 'anomaly') {
+    $('surfacePlot').style.display = 'none';
+    $('surfaceAnomalyBox').style.display = 'block';
+  } else {
+    $('surfacePlot').style.display = 'block';
+    $('surfaceAnomalyBox').style.display = 'none';
+  }
   renderAll();
 }
 
@@ -1271,7 +1441,7 @@ def _warm_all() -> None:
 if __name__ == "__main__":
     print(f"\n  >>> Index Quant Hub  http://127.0.0.1:{PORT}  <<<\n")
     print(
-        "  Preloading SPX + NDX + DJI in parallel. Futu OpenD: 127.0.0.1:11111\n"
+        "  Preloading SPX. Futu OpenD: 127.0.0.1:11111\n"
         f"  DeepSeek insights: {'ON' if USE_DEEPSEEK else 'OFF'}  (set USE_DEEPSEEK=0 to disable)\n"
     )
 

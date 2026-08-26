@@ -8,10 +8,10 @@ This research folder houses two major quantitative studies on US stock indices (
 
 ## Interactive Studies Overview / 研究概述
 
-1. **Option Volatility Surface & PCA Delta Sentiment / 期权波动率曲面与 Delta 主成分分类情绪研究**:
+1. **Option Volatility Surface / 期权波动率曲面研究**:
    - **File / 对应文件:** [vol_surface_study.ipynb](vol_surface_study.ipynb)
-   - **Core Focus / 核心要点:** Ingests options chain matrices, interpolates continuous Implied Volatility grids over Moneyness ($K/S$) and Tenor ($DTE$), applies Dupire's PDE solver for 3D Local Volatility mapping, and reduces option delta changes via PCA to build a real-time Compass Bull/Bear Speedometer.
-   - 解析多维度期权链矩阵，在偏离度（Moneyness）与期限双维度网格上插值出隐含波动率曲面，利用 Dupire 局部波动率偏微分方程提取瞬时局部波动率网格。同时，对曲面每日德尔塔（Delta）特征变动进行 PCA 主成分降维，构建牛熊极值情绪时速指标。
+   - **Core Focus / 核心要点:** Ingests options chain matrices, interpolates continuous Implied Volatility grids over Moneyness ($K/S$) and Tenor ($DTE$), and applies Dupire's PDE solver for 3D Local Volatility mapping. Dealer GEX lives in the live dashboard ([../gex.py](../gex.py)).
+   - 解析多维度期权链矩阵，在偏离度与期限双维度网格上插值出隐含波曲面，并求解 Dupire 局部波动率。GEX 见实时看板。
 
 2. **HMM Volatility Regime Transition Filters / 基于 HMM 的滚动 walk-forward 机制切换研究**:
    - **File / 对应文件:** [vol_regime_study.ipynb](vol_regime_study.ipynb)
@@ -34,11 +34,9 @@ In [vol_surface_study.ipynb](vol_surface_study.ipynb), are generated:
 - **Moneyness-Based IV Contour Grid / 行权价偏离度（Moneyness）与期限隐含波连续热力图**:
   ![IV Surface](../demo/IV_surface.png)
 
-From these structural matrices, we perform PCA via [../surface_sentiment.py](../surface_sentiment.py) to map deformations. Combining Level shifts (PC1) and Twist/Slope shifts (PC2) with basic indicators (skew, slope, VIX), we output the consolidated **Compass Sentiment Speedometer Gauge**:
+Dealer gamma exposure (GEX) is computed on the live dashboard from [../gex.py](../gex.py), sliced by TTM.
 
-通过对差值后的斜率差动态德尔塔（Delta）特征进行主成分降维（PCA），结合 PC1（水平移动）、PC2（扭曲移动）、ATM Skew、Term Slope 和 VIX 绝对水位，输入至集成时速算法，输出 **罗盘牛熊情绪时速表**：
-
-![Compass](../demo/Compass.png)
+做市商 GEX 由实时看板按到期窗口计算，模块位于 [../gex.py](../gex.py)。
 
 ---
 
@@ -78,10 +76,10 @@ Applying this regime filter in a diagnostic long-only trading backtest results i
 
 ## Module Code Integration / 核心脚本联动
 
-- Use [vol_surface_study.ipynb](vol_surface_study.ipynb) to study options surface dynamics and run interactive plots. Reusable production methods are in [../vol_surface.py](../vol_surface.py) and [../surface_sentiment.py](../surface_sentiment.py).
+- Use [vol_surface_study.ipynb](vol_surface_study.ipynb) to study options surface dynamics and run interactive plots. Reusable production methods are in [../vol_surface.py](../vol_surface.py). Dealer GEX is in [../gex.py](../gex.py).
 - Use [vol_regime_study.ipynb](vol_regime_study.ipynb) for retro backtest evaluation of the walk-forward classification engine. Live production-grade rolling predictions are served by [../volatility_regime.py](../volatility_regime.py).
 - Local Web monitoring visual interface is fully integrated inside [../app.py](../app.py).
 
-- 使用 [vol_surface_study.ipynb](vol_surface_study.ipynb) 进行波动曲面、局部波方程插值和 PCA 情绪特征调试，封装模块位于 [../vol_surface.py](../vol_surface.py) 与 [../surface_sentiment.py](../surface_sentiment.py)。
+- 使用 [vol_surface_study.ipynb](vol_surface_study.ipynb) 进行波动曲面和局部波方程插值调试，封装模块位于 [../vol_surface.py](../vol_surface.py)。GEX 见 [../gex.py](../gex.py)。
 - 使用 [vol_regime_study.ipynb](vol_regime_study.ipynb) 进行 HMM 滚动分类机制在各指数下的历史回测和多特征比对，封装模块位于 [../volatility_regime.py](../volatility_regime.py)。
 - 本地 Web 交互与实时信号展现集中在根目录下的核心可视化程序 [../app.py](../app.py) 中。

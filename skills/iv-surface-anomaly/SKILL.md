@@ -4,7 +4,7 @@ description: >-
   Find anomalous nodes on a single-session SPX IV and Dupire local-vol surface;
   cross-check with VVIX, SKEW, and 3M implied correlation. Use when analyzing
   app_simp dashboard/API anomaly lists or notebook surface grids. Not for
-  day-over-day PCA sentiment.
+  dealer GEX or HMM regime signals.
 ---
 
 # IV / Local-Vol Surface Anomaly Hunt
@@ -20,7 +20,7 @@ Call this skill when the user wants to:
 - Relate surface anomalies to VVIX / SKEW / 3M corr context
 
 Do **NOT** use for:
-- Day-over-day surface-delta PCA or sentiment scoring → use `surface-sentiment-analysis` instead
+- Dealer GEX / TTM gamma profiles
 - Multi-index (NDX/DJI) workflows — this skill is **SPX-only**
 - Trade recommendations or price targets
 
@@ -29,8 +29,8 @@ Do **NOT** use for:
 | In scope | Out of scope |
 |----------|--------------|
 | Today's live K/S × DTE surface | Cross-session surface deltas |
-| Raw IV, smooth IV, Dupire local vol | PCA PC1–PC3 sentiment |
-| Structure levels (skew, butterfly, term hump) | Compass fear/greed score |
+| Raw IV, smooth IV, Dupire local vol | Dealer GEX / HMM regimes |
+| Structure levels (skew, butterfly, term hump) | Sentiment / compass scores |
 | Aux indices: VVIX, SKEW, 3M corr | NDX / DJI surfaces |
 
 ## Primary inputs
@@ -91,7 +91,7 @@ from vol_surface import (
     VolSurfaceConfig,
     VolSurfaceStudy,
     build_iv_grid,
-    smooth_iv_grid_quadratic,
+    smooth_iv_grid_svi,
     dupire_local_vol,
     detect_surface_anomalies,
     fetch_aux_vol_context,
@@ -106,7 +106,7 @@ d = sorted(study.surfaces.keys())[-1]
 df = study.surfaces[d]
 spot = float(df["spot"].iloc[0])
 g_dte, g_ks, iv = build_iv_grid(df, max_dte=cfg.max_dte)
-iv_s = smooth_iv_grid_quadratic(df, g_dte, g_ks, iv)
+iv_s = smooth_iv_grid_svi(df, g_dte, g_ks, iv)
 lv = dupire_local_vol(spot, g_dte, g_ks, iv_s, r=cfg.risk_free_rate)
 
 anomalies = detect_surface_anomalies(
@@ -122,7 +122,7 @@ Implemented in `vol_surface.detect_surface_anomalies` — **single session only*
 
 ### 1. `smooth_residual` (surface=`iv`)
 
-Raw IV minus per-DTE quadratic-smooth smile. Flagged when MAD-z ≥ ~3 **and** |residual| ≥ ~2 vol pts.
+Raw IV minus per-DTE **Gatheral SVI** smile (quadratic fallback if a slice will not fit). Flagged when MAD-z ≥ ~3 **and** |residual| ≥ ~2 vol pts.
 
 - Large positive residual: quote/liquidity spike or genuine wing demand not captured by smooth smile
 - Large negative residual: stale/cheap node or interpolation artifact
@@ -202,4 +202,4 @@ Write analysis in this order:
 
 - `app_simp.py` — SPX-only dashboard; anomaly list + aux strip; `/api/index/SPX`
 - `vol_surface.py` — `detect_surface_anomalies`, `fetch_aux_vol_context`, `build_iv_grid`, `smooth_iv_grid_quadratic`, `dupire_local_vol`, `detect_term_hump`
-- `skills/surface-sentiment-analysis/` — separate skill for PCA surface-**delta** sentiment (multi-day cache)
+- `gex.py` — dealer GEX by TTM (live hub, not this skill)
